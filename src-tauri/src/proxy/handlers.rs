@@ -736,10 +736,11 @@ pub async fn handle_responses(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    let codex_converted_to_chat = result.codex_converted_to_chat;
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+    if codex_converted_to_chat {
         return handle_codex_chat_to_responses_transform(
             response,
             &ctx,
@@ -815,10 +816,11 @@ pub async fn handle_responses_compact(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    let codex_converted_to_chat = result.codex_converted_to_chat;
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+    if codex_converted_to_chat {
         return handle_codex_chat_to_responses_transform(
             response,
             &ctx,

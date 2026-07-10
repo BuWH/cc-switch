@@ -527,6 +527,16 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo> {
+        // GitHub Copilot 使用特殊的认证策略：
+        // 返回占位符，真实 Copilot token 由 forwarder 从 CopilotAuthManager 动态注入
+        // （见 forwarder.rs 中对 AuthStrategy::GitHubCopilot 的处理）。
+        if provider.is_github_copilot() {
+            return Some(AuthInfo::new(
+                "copilot_placeholder".to_string(),
+                AuthStrategy::GitHubCopilot,
+            ));
+        }
+
         self.extract_key(provider)
             .map(|key| AuthInfo::new(key, AuthStrategy::Bearer))
     }
@@ -569,6 +579,64 @@ impl ProviderAdapter for CodexAdapter {
     ) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, ProxyError> {
         use super::adapter::auth_header_value;
         let bearer = format!("Bearer {}", auth.api_key);
+
+        // GitHub Copilot：注入与 Claude 侧一致的 Copilot 指纹 headers。
+        // 真实 token 已由 forwarder 动态填充到 auth.api_key。
+        if auth.strategy == AuthStrategy::GitHubCopilot {
+            use super::copilot_auth;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            return Ok(vec![
+                (
+                    http::HeaderName::from_static("authorization"),
+                    auth_header_value(&bearer)?,
+                ),
+                (
+                    http::HeaderName::from_static("editor-version"),
+                    http::HeaderValue::from_static(copilot_auth::COPILOT_EDITOR_VERSION),
+                ),
+                (
+                    http::HeaderName::from_static("editor-plugin-version"),
+                    http::HeaderValue::from_static(copilot_auth::COPILOT_PLUGIN_VERSION),
+                ),
+                (
+                    http::HeaderName::from_static("copilot-integration-id"),
+                    http::HeaderValue::from_static(copilot_auth::COPILOT_INTEGRATION_ID),
+                ),
+                (
+                    http::HeaderName::from_static("user-agent"),
+                    http::HeaderValue::from_static(copilot_auth::COPILOT_USER_AGENT),
+                ),
+                (
+                    http::HeaderName::from_static("x-github-api-version"),
+                    http::HeaderValue::from_static(copilot_auth::COPILOT_API_VERSION),
+                ),
+                (
+                    http::HeaderName::from_static("openai-intent"),
+                    http::HeaderValue::from_static("conversation-agent"),
+                ),
+                (
+                    http::HeaderName::from_static("x-initiator"),
+                    http::HeaderValue::from_static("user"),
+                ),
+                (
+                    http::HeaderName::from_static("x-interaction-type"),
+                    http::HeaderValue::from_static("conversation-agent"),
+                ),
+                (
+                    http::HeaderName::from_static("x-vscode-user-agent-library-version"),
+                    http::HeaderValue::from_static("electron-fetch"),
+                ),
+                (
+                    http::HeaderName::from_static("x-request-id"),
+                    auth_header_value(&request_id)?,
+                ),
+                (
+                    http::HeaderName::from_static("x-agent-task-id"),
+                    auth_header_value(&request_id)?,
+                ),
+            ]);
+        }
+
         Ok(vec![(
             http::HeaderName::from_static("authorization"),
             auth_header_value(&bearer)?,
@@ -621,6 +689,40 @@ mod tests {
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.api_key, "sk-test-key-12345678");
         assert_eq!(auth.strategy, AuthStrategy::Bearer);
+    }
+
+    #[test]
+    fn test_extract_auth_github_copilot_by_provider_type() {
+        use crate::provider::ProviderMeta;
+        let adapter = CodexAdapter::new();
+        let mut provider = create_provider(json!({
+            "base_url": "https://api.githubcopilot.com",
+            "config": "wire_api = \"chat\"",
+        }));
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            ..Default::default()
+        });
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        // Copilot 使用占位符，真实 token 由 forwarder 动态注入
+        assert_eq!(auth.strategy, AuthStrategy::GitHubCopilot);
+        assert_eq!(auth.api_key, "copilot_placeholder");
+    }
+
+    #[test]
+    fn test_get_auth_headers_github_copilot_includes_fingerprint() {
+        let adapter = CodexAdapter::new();
+        let auth = AuthInfo::new(
+            "real-copilot-token".to_string(),
+            AuthStrategy::GitHubCopilot,
+        );
+        let headers = adapter.get_auth_headers(&auth).unwrap();
+        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"authorization"));
+        assert!(names.contains(&"editor-version"));
+        assert!(names.contains(&"copilot-integration-id"));
+        assert!(names.contains(&"x-request-id"));
     }
 
     #[test]

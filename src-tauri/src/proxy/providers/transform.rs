@@ -512,6 +512,54 @@ pub fn clean_schema(mut schema: Value) -> Value {
     schema
 }
 
+/// 将 OpenAI usage 映射为 Anthropic usage_json。
+/// OpenAI prompt_tokens 含缓存命中，Anthropic input_tokens 不含 → 减去 cache_read 与
+/// cache_creation，使 input 成为 fresh input。本路径以 app_type="claude" 记账（calculator
+/// 不再扣减），若不减则缓存会被计入 input 与各 cache 桶两次。三桶互斥，恒等：
+/// input + cache_read + cache_creation == prompt_tokens（inclusive 上游）。
+/// 与流式 build_anthropic_usage_json (#2774) 及 transform_gemini 的 saturating_sub 对称。
+/// 最终 cache_read：直传字段优先于 nested；cache_creation 仅来自直传字段（OpenAI 无此概念）。
+fn build_anthropic_usage_json(body: &Value) -> Value {
+    let usage = body.get("usage").cloned().unwrap_or(json!({}));
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(cached)
+        .saturating_sub(cache_creation) as u32;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let mut usage_json = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+
+    if cached > 0 {
+        usage_json["cache_read_input_tokens"] = json!(cached);
+    }
+    if cache_creation > 0 {
+        usage_json["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+
+    usage_json
+}
+
 /// OpenAI 响应 → Anthropic 响应
 pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     let choices = body
@@ -519,9 +567,21 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         .and_then(|c| c.as_array())
         .ok_or_else(|| ProxyError::TransformError("No choices in response".to_string()))?;
 
-    let choice = choices
-        .first()
-        .ok_or_else(|| ProxyError::TransformError("Empty choices array".to_string()))?;
+    // choices 字段存在但为空数组 `[]` 是合法的（如 Copilot 的 Claude 模型在 max_tokens=1
+    // 分类请求下可能返回 200 + 空 choices）。降级为合法的空 Anthropic 消息，避免误判为
+    // 422 导致 Claude Code auto 模式锁死。usage 与正常路径一致记账。
+    let Some(choice) = choices.first() else {
+        return Ok(json!({
+            "id": body.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": build_anthropic_usage_json(&body)
+        }));
+    };
 
     let message = choice
         .get("message")
@@ -646,50 +706,6 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         })
         .or(if has_tool_use { Some("tool_use") } else { None });
 
-    // usage — map cache tokens from OpenAI format to Anthropic format
-    let usage = body.get("usage").cloned().unwrap_or(json!({}));
-    // OpenAI prompt_tokens 含缓存命中，Anthropic input_tokens 不含 → 减去 cache_read 与
-    // cache_creation，使 input 成为 fresh input。本路径以 app_type="claude" 记账（calculator
-    // 不再扣减），若不减则缓存会被计入 input 与各 cache 桶两次。三桶互斥，恒等：
-    // input + cache_read + cache_creation == prompt_tokens（inclusive 上游）。
-    // 与流式 build_anthropic_usage_json (#2774) 及 transform_gemini 的 saturating_sub 对称。
-    // 最终 cache_read：直传字段优先于 nested；cache_creation 仅来自直传字段（OpenAI 无此概念）。
-    let cached = usage
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(|v| v.as_u64())
-        })
-        .unwrap_or(0);
-    let cache_creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .saturating_sub(cached)
-        .saturating_sub(cache_creation) as u32;
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-
-    let mut usage_json = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-
-    if cached > 0 {
-        usage_json["cache_read_input_tokens"] = json!(cached);
-    }
-    if cache_creation > 0 {
-        usage_json["cache_creation_input_tokens"] = json!(cache_creation);
-    }
-
     let result = json!({
         "id": body.get("id").and_then(|i| i.as_str()).unwrap_or(""),
         "type": "message",
@@ -698,7 +714,7 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": usage_json
+        "usage": build_anthropic_usage_json(&body)
     });
 
     Ok(result)
@@ -1064,6 +1080,40 @@ mod tests {
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(result["usage"]["input_tokens"], 10);
         assert_eq!(result["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_empty_choices_degrades_to_valid_empty() {
+        // choices 存在但为空数组 → 降级为合法空消息，而非报错
+        let input = json!({
+            "id": "chatcmpl-empty",
+            "object": "chat.completion",
+            "model": "claude-sonnet-4-5",
+            "choices": [],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 0, "total_tokens": 8}
+        });
+
+        let result = openai_to_anthropic(input).unwrap();
+        assert_eq!(result["id"], "chatcmpl-empty");
+        assert_eq!(result["type"], "message");
+        assert_eq!(result["role"], "assistant");
+        assert!(result["content"].as_array().unwrap().is_empty());
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["usage"]["input_tokens"], 8);
+        assert_eq!(result["usage"]["output_tokens"], 0);
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_missing_choices_still_errors() {
+        // choices 字段缺失 → 仍然报错
+        let input = json!({
+            "id": "chatcmpl-missing",
+            "object": "chat.completion",
+            "model": "claude-sonnet-4-5",
+            "usage": {"prompt_tokens": 8, "completion_tokens": 0}
+        });
+
+        assert!(openai_to_anthropic(input).is_err());
     }
 
     #[test]

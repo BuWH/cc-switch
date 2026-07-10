@@ -1243,9 +1243,21 @@ pub(crate) fn chat_completion_to_response_with_context(
         .get("choices")
         .and_then(|v| v.as_array())
         .ok_or_else(|| ProxyError::TransformError("No choices in chat response".to_string()))?;
-    let choice = choices
-        .first()
-        .ok_or_else(|| ProxyError::TransformError("Empty choices in chat response".to_string()))?;
+
+    // choices 字段存在但为空数组 `[]` 是合法的（如上游模型在 max_tokens=1 分类请求下可能
+    // 返回 200 + 空 choices）。降级为合法的空 Responses 响应，避免误判为 422 导致
+    // Claude Code auto 模式锁死。usage 与正常路径一致记账。
+    let Some(choice) = choices.first() else {
+        return Ok(json!({
+            "id": response_id_from_chat_id(body.get("id").and_then(|v| v.as_str())),
+            "object": "response",
+            "created_at": body.get("created").and_then(|v| v.as_u64()).unwrap_or(0),
+            "status": "completed",
+            "model": body.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+            "output": [],
+            "usage": chat_usage_to_responses_usage(body.get("usage"))
+        }));
+    };
     let message = choice
         .get("message")
         .ok_or_else(|| ProxyError::TransformError("No message in chat choice".to_string()))?;
@@ -2818,6 +2830,42 @@ mod tests {
         assert_eq!(
             result["output"][0]["arguments"],
             r#"{"label_ids":["UNREAD"],"max_results":5,"query":"-in:spam -in:trash"}"#
+        );
+    }
+
+    #[test]
+    fn chat_response_empty_choices_degrades_to_valid_empty() {
+        // choices 存在但为空数组 → 降级为合法空 Responses 响应，而非报错
+        let chat = json!({
+            "id": "chatcmpl_empty",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-5.4",
+            "choices": [],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7}
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+
+        assert_eq!(result["object"], "response");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["model"], "gpt-5.4");
+        assert!(result["output"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_response_missing_choices_still_errors() {
+        // choices 字段缺失 → 仍然报错
+        let chat = json!({
+            "id": "chatcmpl_missing",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-5.4"
+        });
+
+        assert!(
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).is_err()
         );
     }
 

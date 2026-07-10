@@ -554,7 +554,17 @@ impl ProviderAdapter for CodexAdapter {
         let already_has_v1 = base_trimmed.ends_with("/v1");
         let origin_only = is_origin_only_url(base_trimmed);
 
-        let mut url = if already_has_v1 {
+        // GitHub Copilot 的 Chat Completions 端点无 /v1 前缀
+        // （host 为 api.githubcopilot.com / api.enterprise.githubcopilot.com）。
+        // 这些是纯 origin，会命中下面的 origin_only 分支被自动补 /v1，导致
+        // 拼成 .../v1/chat/completions 而上游返回 404。对 Copilot host 直接拼接。
+        let is_copilot_host = base_trimmed
+            .to_ascii_lowercase()
+            .contains("githubcopilot.com");
+
+        let mut url = if is_copilot_host {
+            format!("{base_trimmed}/{endpoint_trimmed}")
+        } else if already_has_v1 {
             // 已经有 /v1，直接拼接
             format!("{base_trimmed}/{endpoint_trimmed}")
         } else if origin_only {
@@ -784,6 +794,28 @@ experimental_bearer_token = "sk-config-key"
         // base_url 已包含 /v1，endpoint 也包含 /v1
         let url = adapter.build_url("https://www.packyapi.com/v1", "/v1/responses");
         assert_eq!(url, "https://www.packyapi.com/v1/responses");
+    }
+
+    #[test]
+    fn test_build_url_copilot_no_v1() {
+        let adapter = CodexAdapter::new();
+        // GitHub Copilot 的 chat/completions 端点无 /v1 前缀，
+        // 即便 host 是纯 origin 也不能自动补 /v1（否则上游 404）。
+        let url = adapter.build_url("https://api.githubcopilot.com", "/chat/completions");
+        assert_eq!(url, "https://api.githubcopilot.com/chat/completions");
+    }
+
+    #[test]
+    fn test_build_url_enterprise_copilot_no_v1() {
+        let adapter = CodexAdapter::new();
+        let url = adapter.build_url(
+            "https://api.enterprise.githubcopilot.com",
+            "/chat/completions",
+        );
+        assert_eq!(
+            url,
+            "https://api.enterprise.githubcopilot.com/chat/completions"
+        );
     }
 
     // 官方客户端检测测试

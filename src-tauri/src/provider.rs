@@ -74,6 +74,14 @@ impl Provider {
     pub fn is_github_copilot(&self) -> bool {
         self.provider_type() == Some("github_copilot")
             || self.claude_base_url_contains("githubcopilot.com")
+            || self
+                .meta
+                .as_ref()
+                .and_then(|m| m.auth_binding.as_ref())
+                .is_some_and(|b| {
+                    b.source == AuthBindingSource::ManagedAccount
+                        && b.auth_provider.as_deref() == Some("github_copilot")
+                })
     }
 
     pub fn uses_managed_account_auth(&self) -> bool {
@@ -961,8 +969,9 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        AuthBinding, AuthBindingSource, ClaudeModelConfig, CodexModelConfig, GeminiModelConfig,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1091,6 +1100,30 @@ mod tests {
             ..Default::default()
         });
         assert!(copilot.is_github_copilot());
+    }
+
+    #[test]
+    fn is_github_copilot_via_auth_binding_without_provider_type() {
+        // 前端保存 Codex Copilot provider 时可能未写入 providerType，
+        // 但会写入 authBinding（source=managed_account, authProvider=github_copilot）。
+        // is_github_copilot 需据此兜底识别，否则代理拿不到 Copilot 认证策略。
+        let mut provider = Provider::with_id(
+            "codex-copilot".to_string(),
+            "GitHub Copilot".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: None,
+            auth_binding: Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("github_copilot".to_string()),
+                account_id: Some("27070837".to_string()),
+            }),
+            ..Default::default()
+        });
+        assert!(provider.is_github_copilot());
+        assert!(provider.uses_managed_account_auth());
     }
 
     #[test]

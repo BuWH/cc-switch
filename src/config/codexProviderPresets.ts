@@ -131,7 +131,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     // 认证使用 GitHub Copilot OAuth（无需 API Key），真实 token 由代理动态注入。
     auth: generateThirdPartyAuth(""),
     config: `model_provider = "github_copilot"
-model = "gpt-5.5"
+model = "gpt-4o"
 model_reasoning_effort = "high"
 disable_response_storage = true
 
@@ -145,13 +145,23 @@ wire_api = "chat"`,
     requiresOAuth: true,
     modelCatalog: modelCatalog([
       {
-        model: "gpt-5.5",
-        displayName: "GPT-5.5",
-        contextWindow: 264000,
+        model: "gpt-4o",
+        displayName: "GPT-4o",
+        contextWindow: 128000,
       },
       {
-        model: "claude-sonnet-4.6",
-        displayName: "Claude Sonnet 4.6",
+        model: "gpt-4.1",
+        displayName: "GPT-4.1",
+        contextWindow: 1000000,
+      },
+      {
+        model: "claude-sonnet-4.5",
+        displayName: "Claude Sonnet 4.5",
+        contextWindow: 200000,
+      },
+      {
+        model: "claude-sonnet-4",
+        displayName: "Claude Sonnet 4",
         contextWindow: 200000,
       },
     ]),

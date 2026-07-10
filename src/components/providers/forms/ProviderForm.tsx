@@ -1127,7 +1127,8 @@ function ProviderFormFull({
     const isCopilotProvider =
       templatePreset?.providerType === "github_copilot" ||
       initialData?.meta?.providerType === "github_copilot" ||
-      baseUrl.includes("githubcopilot.com");
+      baseUrl.includes("githubcopilot.com") ||
+      (appId === "codex" && codexBaseUrl.includes("githubcopilot.com"));
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
@@ -1198,14 +1199,14 @@ function ProviderFormFull({
           );
         }
       } else if (appId === "codex") {
-        if (!codexBaseUrl.trim()) {
+        if (!isCopilotProvider && !codexBaseUrl.trim()) {
           issues.push(
             t("providerForm.endpointRequired", {
               defaultValue: "非官方供应商请填写 API 端点",
             }),
           );
         }
-        if (!codexApiKey.trim()) {
+        if (!isCopilotProvider && !codexApiKey.trim()) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -1259,7 +1260,8 @@ function ProviderFormFull({
     const isCopilotProvider =
       templatePreset?.providerType === "github_copilot" ||
       initialData?.meta?.providerType === "github_copilot" ||
-      baseUrl.includes("githubcopilot.com");
+      baseUrl.includes("githubcopilot.com") ||
+      (appId === "codex" && codexBaseUrl.includes("githubcopilot.com"));
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
@@ -2121,6 +2123,18 @@ function ProviderFormFull({
           {appId === "codex" && (
             <CodexFormFields
               providerId={providerId}
+              isCopilotPreset={
+                templatePreset?.providerType === "github_copilot" ||
+                initialData?.meta?.providerType === "github_copilot" ||
+                codexBaseUrl.includes("githubcopilot.com")
+              }
+              usesOAuth={
+                templatePreset?.providerType === "github_copilot" ||
+                initialData?.meta?.providerType === "github_copilot" ||
+                codexBaseUrl.includes("githubcopilot.com")
+              }
+              selectedGitHubAccountId={selectedGitHubAccountId}
+              onGitHubAccountSelect={setSelectedGitHubAccountId}
               codexApiKey={codexApiKey}
               onApiKeyChange={handleCodexApiKeyChange}
               category={category}

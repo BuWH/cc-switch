@@ -34,6 +34,7 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
+import { CopilotAuthSection } from "./CopilotAuthSection";
 import { cn } from "@/lib/utils";
 import type {
   CodexApiFormat,
@@ -48,6 +49,11 @@ interface EndpointCandidate {
 
 interface CodexFormFieldsProps {
   providerId?: string;
+  // GitHub Copilot OAuth（预设 providerType === "github_copilot" 时渲染认证区块）
+  isCopilotPreset?: boolean;
+  usesOAuth?: boolean;
+  selectedGitHubAccountId?: string | null;
+  onGitHubAccountSelect?: (accountId: string | null) => void;
   // API Key
   codexApiKey: string;
   onApiKeyChange: (key: string) => void;
@@ -139,6 +145,10 @@ function catalogRowsMatchModels(
 
 export function CodexFormFields({
   providerId,
+  isCopilotPreset,
+  usesOAuth,
+  selectedGitHubAccountId,
+  onGitHubAccountSelect,
   codexApiKey,
   onApiKeyChange,
   category,
@@ -346,29 +356,39 @@ export function CodexFormFields({
 
   return (
     <>
-      {/* Codex API Key 输入框 */}
-      <ApiKeySection
-        id="codexApiKey"
-        label="API Key"
-        value={codexApiKey}
-        onChange={onApiKeyChange}
-        category={category}
-        shouldShowLink={shouldShowApiKeyLink}
-        websiteUrl={websiteUrl}
-        isPartner={isPartner}
-        partnerPromotionKey={partnerPromotionKey}
-        placeholder={{
-          official: t("providerForm.codexOfficialNoApiKey", {
-            defaultValue: "官方供应商无需 API Key",
-          }),
-          thirdParty: t("providerForm.codexApiKeyAutoFill", {
-            defaultValue: "输入 API Key，将自动填充到配置",
-          }),
-        }}
-      />
+      {/* GitHub Copilot OAuth 认证 */}
+      {isCopilotPreset && (
+        <CopilotAuthSection
+          selectedAccountId={selectedGitHubAccountId}
+          onAccountSelect={onGitHubAccountSelect}
+        />
+      )}
 
-      {/* Codex Base URL 输入框 */}
-      {shouldShowSpeedTest && (
+      {/* Codex API Key 输入框（OAuth 预设时隐藏） */}
+      {!usesOAuth && (
+        <ApiKeySection
+          id="codexApiKey"
+          label="API Key"
+          value={codexApiKey}
+          onChange={onApiKeyChange}
+          category={category}
+          shouldShowLink={shouldShowApiKeyLink}
+          websiteUrl={websiteUrl}
+          isPartner={isPartner}
+          partnerPromotionKey={partnerPromotionKey}
+          placeholder={{
+            official: t("providerForm.codexOfficialNoApiKey", {
+              defaultValue: "官方供应商无需 API Key",
+            }),
+            thirdParty: t("providerForm.codexApiKeyAutoFill", {
+              defaultValue: "输入 API Key，将自动填充到配置",
+            }),
+          }}
+        />
+      )}
+
+      {/* Codex Base URL 输入框（OAuth 预设时隐藏） */}
+      {shouldShowSpeedTest && !usesOAuth && (
         <EndpointField
           id="codexBaseUrl"
           label={t("codexConfig.apiUrlLabel")}
@@ -384,7 +404,7 @@ export function CodexFormFields({
       )}
 
       {/* 高级选项 —— 上游格式/模型映射/思考能力/自定义 UA；预设供应商通常无需展开 */}
-      {category !== "official" && (
+      {category !== "official" && !usesOAuth && (
         <Collapsible
           open={advancedExpanded}
           onOpenChange={setAdvancedExpanded}

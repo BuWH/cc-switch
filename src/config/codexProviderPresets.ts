@@ -133,6 +133,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     config: `model_provider = "github_copilot"
 model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
+model_context_window = 1000000
 disable_response_storage = true
 
 [model_providers.github_copilot]

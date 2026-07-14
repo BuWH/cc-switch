@@ -575,7 +575,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model, codex_converted_to_chat)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    codex_converted_to_chat,
+                                )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -722,7 +727,12 @@ impl RequestForwarder {
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model, codex_converted_to_chat)) => {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        codex_converted_to_chat,
+                                    )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -889,7 +899,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model, codex_converted_to_chat)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    codex_converted_to_chat,
+                                )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -1315,7 +1330,10 @@ impl RequestForwarder {
         // 模型保留 Responses 透传（不转 chat），避免 "not supported via ..." 400。
         if codex_responses_to_chat && is_copilot {
             if let Some(model_id) = mapped_body.get("model").and_then(|v| v.as_str()) {
-                if self.is_copilot_openai_vendor_model(provider, model_id).await {
+                if self
+                    .is_copilot_openai_vendor_model(provider, model_id)
+                    .await
+                {
                     codex_responses_to_chat = false;
                 }
             }
@@ -1401,6 +1419,16 @@ impl RequestForwarder {
         } else {
             mapped_body
         };
+
+        if matches!(app_type, AppType::Codex)
+            && is_copilot
+            && !codex_responses_to_chat
+            && raise_copilot_minimal_effort_for_web_search(&mut request_body)
+        {
+            log::debug!(
+                "[Copilot] Raised reasoning.effort from minimal to low for Responses web_search compatibility"
+            );
+        }
 
         if matches!(app_type, AppType::Codex) {
             self.apply_media_prevention(&mut request_body, provider);
@@ -2476,6 +2504,28 @@ fn append_query_to_full_url(base_url: &str, query: Option<&str>) -> String {
     }
 }
 
+fn raise_copilot_minimal_effort_for_web_search(body: &mut Value) -> bool {
+    let has_web_search = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tool_type| tool_type.starts_with("web_search"))
+            })
+        });
+
+    if !has_web_search
+        || body.pointer("/reasoning/effort").and_then(Value::as_str) != Some("minimal")
+    {
+        return false;
+    }
+
+    body["reasoning"]["effort"] = Value::String("low".to_string());
+    true
+}
+
 fn build_codex_oauth_session_headers(
     session_id: &str,
 ) -> Vec<(http::HeaderName, http::HeaderValue)> {
@@ -3377,6 +3427,54 @@ mod tests {
 
         assert_eq!(endpoint, "/chat/completions?foo=bar");
         assert_eq!(passthrough_query.as_deref(), Some("foo=bar"));
+    }
+
+    #[test]
+    fn copilot_responses_raises_minimal_effort_when_web_search_is_present() {
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "reasoning": {"effort": "minimal"},
+            "tools": [
+                {"type": "function", "name": "read_file"},
+                {"type": "web_search"}
+            ]
+        });
+
+        assert!(raise_copilot_minimal_effort_for_web_search(&mut body));
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn copilot_responses_raises_minimal_effort_for_web_search_preview() {
+        let mut body = json!({
+            "reasoning": {"effort": "minimal"},
+            "tools": [{"type": "web_search_preview"}]
+        });
+
+        assert!(raise_copilot_minimal_effort_for_web_search(&mut body));
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn copilot_responses_keeps_minimal_effort_without_web_search() {
+        let mut body = json!({
+            "reasoning": {"effort": "minimal"},
+            "tools": [{"type": "function", "name": "read_file"}]
+        });
+
+        assert!(!raise_copilot_minimal_effort_for_web_search(&mut body));
+        assert_eq!(body["reasoning"]["effort"], "minimal");
+    }
+
+    #[test]
+    fn copilot_responses_keeps_explicit_non_minimal_effort() {
+        let mut body = json!({
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "web_search"}]
+        });
+
+        assert!(!raise_copilot_minimal_effort_for_web_search(&mut body));
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]

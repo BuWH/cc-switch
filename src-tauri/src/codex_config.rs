@@ -470,6 +470,9 @@ fn codex_catalog_model_entry(
     entry_obj.insert("service_tiers".to_string(), json!([]));
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
+    entry_obj
+        .entry("supports_reasoning_summaries".to_string())
+        .or_insert_with(|| json!(true));
 
     // Image support is a model capability, not a tool-profile capability.
     // Trust hidden preset metadata first, then the confirmed text-only registry;
@@ -2922,6 +2925,34 @@ base_url = "https://production.api/v1"
         assert!(
             base.is_some_and(|s| !s.trim().is_empty()),
             "every native entry must carry a non-empty base_instructions (Codex requires it)"
+        );
+    }
+
+    #[test]
+    fn generated_catalog_repairs_stale_template_missing_reasoning_summary_support() {
+        let mut template = load_codex_native_responses_template();
+        template
+            .as_object_mut()
+            .expect("template object")
+            .remove("supports_reasoning_summaries");
+        let specs = vec![CodexCatalogModelSpec {
+            model: "custom-model".to_string(),
+            display_name: "Custom Model".to_string(),
+            context_window: 128_000,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+        }];
+
+        let catalog =
+            codex_model_catalog_from_specs(&specs, &template, CodexCatalogToolProfile::ProxyChat);
+
+        assert_eq!(
+            catalog["models"][0]
+                .get("supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(true),
+            "generated entries must satisfy the current Codex catalog schema even when the cached template is stale"
         );
     }
 

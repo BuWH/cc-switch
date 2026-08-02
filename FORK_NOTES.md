@@ -48,6 +48,15 @@ cd /path/to/ccsw && bun run tauri dev
 # 首次启动后在 dev UI 里把 proxy 端口改成 15722(避免撞 15721)
 ```
 
+## 正式版替换安全规则
+
+正式版是当前 Codex token provider，禁止采用“先退出、再执行复制/启动命令”的多步交互
+流程。旧版退出后 agent 可能断连，导致新版永远没有机会启动。
+
+统一使用 `scripts/replace-cc-switch-app.sh`：它先在线完成预检和 staging，再把停旧版、
+原子替换、启动、`/health` 验证及失败回滚交给独立的用户域 launchd job。命令返回
+`SCHEDULED` 后，当前 agent 必须立即结束回复，不再执行后续工具调用。
+
 ## Codex + Copilot 使用步骤
 
 1. dev 版 UI → Codex → 添加 provider → 选 "GitHub Copilot" preset

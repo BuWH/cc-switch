@@ -105,16 +105,41 @@ xattr -cr "src-tauri/target/release/bundle/macos/CC Switch.app"
 codesign --force --deep --sign - "src-tauri/target/release/bundle/macos/CC Switch.app"
 ```
 
-### 替换步骤（会短暂中断依赖代理的 Claude Code 会话）
+### 替换步骤（provider-safe）
+
+CC Switch 本身是 Codex/Claude Code 的 provider。不能在一个交互流程里先退出旧版，
+再依赖后续命令复制和启动新版：旧版一停，当前 agent 连接也可能立即中断。
+
+必须使用仓库内的 launchd 托管替换脚本。脚本会在 provider 仍在线时完成 DMG 校验、
+staging 和 ad-hoc 签名，然后把退出、原子替换、启动、健康检查与失败回滚交给独立的
+用户域 launchd job。默认延迟 30 秒，给当前 agent 足够时间返回“已调度”结果。
+
 ```bash
-# 1. 退出当前 CC Switch
-# 2. 替换
-rm -rf "/Applications/CC Switch.app"
-cp -R "src-tauri/target/release/bundle/macos/CC Switch.app" /Applications/
-xattr -cr "/Applications/CC Switch.app"
-# 3. 首次右键→打开（过 Gatekeeper），之后正常双击
-open "/Applications/CC Switch.app"
-# 4. 重启 Claude Code
+# 只做完整预检，不替换
+scripts/replace-cc-switch-app.sh \
+  --dmg "src-tauri/target/release/bundle/dmg/CC Switch_3.18.0_aarch64.dmg" \
+  --expected-version 3.18.0 \
+  --check-only
+
+# 调度替换。命令返回 SCHEDULED 后不要再执行工具调用，立即结束当前 agent 回复。
+scripts/replace-cc-switch-app.sh \
+  --dmg "src-tauri/target/release/bundle/dmg/CC Switch_3.18.0_aarch64.dmg" \
+  --expected-version 3.18.0
+```
+
+launchd worker 会自动:
+
+1. 优雅退出旧版，必要时发送 `TERM`；
+2. 在 `/Applications` 内原子换名，保留旧版作为临时回滚备份；
+3. 启动新版并等待 `http://127.0.0.1:15721/health`；
+4. 新版失败时恢复并启动旧版；
+5. 写入 `/private/tmp/cc-switch-replace-latest.status` 和 `.log`，并发系统通知。
+
+连接恢复后的下一次会话先检查:
+
+```bash
+cat /private/tmp/cc-switch-replace-latest.status
+tail -n 100 /private/tmp/cc-switch-replace-latest.log
 ```
 
 ### Codex + Copilot 使用

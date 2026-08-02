@@ -3640,15 +3640,19 @@ wire_api = "responses"
             .remove("supports_reasoning_summaries");
         let specs = vec![CodexCatalogModelSpec {
             model: "custom-model".to_string(),
-            display_name: "Custom Model".to_string(),
-            context_window: 128_000,
+            display_name: Some("Custom Model".to_string()),
+            context_window: Some(128_000),
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
         }];
 
-        let catalog =
-            codex_model_catalog_from_specs(&specs, &template, CodexCatalogToolProfile::ProxyChat);
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &template,
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
+        );
 
         assert_eq!(
             catalog["models"][0]

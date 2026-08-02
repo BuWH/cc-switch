@@ -164,6 +164,12 @@ wait_for_any_healthy_app() {
   return 1
 }
 
+cleanup_worker_job() {
+  if [[ -n "${JOB_LABEL:-}" ]]; then
+    launchctl remove "$JOB_LABEL" >/dev/null 2>&1 || true
+  fi
+}
+
 rollback_install() {
   local reason="$1"
   local failed_path="${APP_PATH}.failed-${RUN_ID}"
@@ -200,11 +206,27 @@ worker_main() {
   PORT="$6"
   STATUS_PATH="$7"
   LOG_PATH="$8"
+  JOB_LABEL="$9"
   BACKUP_PATH="${APP_PATH}.backup-${RUN_ID}"
   HOST_ARCH="$(uname -m)"
 
   exec >>"$LOG_PATH" 2>&1
+  trap cleanup_worker_job EXIT
   print -r -- "[$(timestamp)] worker started; delay=${DELAY}s"
+
+  if [[ ! -d "$CANDIDATE_PATH" ]]; then
+    if [[ "$(app_version "$APP_PATH" 2>/dev/null || true)" == "$EXPECTED_VERSION" ]] &&
+      health_is_ready; then
+      write_status "success" \
+        "CC Switch ${EXPECTED_VERSION} already installed; provider healthy"
+      print -r -- "[$(timestamp)] staged app already consumed; replacement is healthy"
+      return 0
+    fi
+    write_status "failed" "pre-staged app is missing"
+    print -u2 "App bundle not found: $CANDIDATE_PATH"
+    return 1
+  fi
+
   write_status "waiting" "launchd worker started; waiting before provider restart"
   sleep "$DELAY"
 
@@ -260,7 +282,7 @@ worker_main() {
 
 if [[ "${1:-}" == "--worker" ]]; then
   shift
-  [[ "$#" -eq 8 ]] || {
+  [[ "$#" -eq 9 ]] || {
     print -u2 "Invalid worker invocation"
     exit 64
   }
@@ -415,7 +437,7 @@ LABEL="com.ccswitch.replace.${RUN_ID}"
 if ! launchctl submit -l "$LABEL" -- \
   /bin/zsh "$SCRIPT_PATH" --worker \
   "$RUN_ID" "$EXPECTED_VERSION" "$DELAY" "$CANDIDATE_PATH" \
-  "$APP_PATH" "$PORT" "$STATUS_PATH" "$LOG_PATH"; then
+  "$APP_PATH" "$PORT" "$STATUS_PATH" "$LOG_PATH" "$LABEL"; then
   rm -rf "$CANDIDATE_PATH"
   write_status "failed" "unable to submit launchd replacement worker"
   print -u2 "Unable to submit launchd replacement worker"

@@ -451,6 +451,37 @@ pub fn codex_auth_has_credential_login_material(auth: &Value) -> bool {
         })
 }
 
+/// True when `auth.json` contains a reusable ChatGPT OAuth login.
+///
+/// Codex Desktop now exposes its account token to plugins and remote control
+/// only when the active model provider requires OpenAI auth. Merely preserving
+/// these tokens on disk is not sufficient, so proxy takeover uses this
+/// predicate to decide whether the local provider should keep native auth
+/// active.
+pub fn codex_auth_has_chatgpt_login_material(auth: &Value) -> bool {
+    let auth_mode_is_chatgpt = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .is_none_or(|mode| mode.eq_ignore_ascii_case("chatgpt"));
+    if !auth_mode_is_chatgpt {
+        return false;
+    }
+
+    auth.get("tokens")
+        .and_then(Value::as_object)
+        .is_some_and(|tokens| {
+            ["id_token", "access_token", "refresh_token"]
+                .iter()
+                .any(|key| {
+                    tokens
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .is_some_and(|token| !token.is_empty())
+                })
+        })
+}
+
 /// True when live `auth.json` is the shape a preserve-off third-party switch
 /// leaves behind: an `OPENAI_API_KEY` (possibly alongside metadata like
 /// `auth_mode` / `last_refresh`) with no real login credential next to it.
@@ -2158,6 +2189,76 @@ pub fn prepare_codex_provider_live_config(
     })
 }
 
+/// Configure the active provider to use Codex's native ChatGPT auth while its
+/// endpoint points at the local proxy.
+///
+/// The proxy replaces the incoming OpenAI authorization with the selected
+/// third-party provider credential before forwarding. Keeping
+/// `requires_openai_auth` enabled therefore preserves Desktop account features
+/// without leaking the ChatGPT token upstream.
+pub fn activate_codex_chatgpt_auth_for_proxy_route(config_text: &str) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let provider_id = active_codex_model_provider_id(&doc).ok_or_else(|| {
+        AppError::Message(
+            "Invalid Codex config.toml: proxy route is missing model_provider".to_string(),
+        )
+    })?;
+
+    let provider_table = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            AppError::Message(format!(
+                "Invalid Codex config.toml: model provider `{provider_id}` is missing"
+            ))
+        })?;
+
+    provider_table.insert("requires_openai_auth", toml_edit::value(true));
+    provider_table.remove("experimental_bearer_token");
+    doc.as_table_mut().remove("experimental_bearer_token");
+    Ok(doc.to_string())
+}
+
+pub fn deactivate_codex_chatgpt_auth_for_proxy_route(
+    config_text: &str,
+) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let Some(provider_id) = active_codex_model_provider_id(&doc) else {
+        return Ok(config_text.to_string());
+    };
+    if let Some(provider_table) = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        provider_table.remove("requires_openai_auth");
+    }
+    Ok(doc.to_string())
+}
+
+pub fn codex_config_active_provider_requires_openai_auth(config_text: &str) -> bool {
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let Some(provider_id) = active_codex_model_provider_id(&doc) else {
+        return false;
+    };
+    doc.get("model_providers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|provider| provider.get("requires_openai_auth"))
+        .and_then(toml_edit::Item::as_bool)
+        == Some(true)
+}
+
 /// During DB backfill, lift a live `experimental_bearer_token` back into
 /// `auth.OPENAI_API_KEY` so the stored provider keeps its canonical shape
 /// and generated live tokens don't leak into stored provider TOML.
@@ -2755,6 +2856,63 @@ experimental_bearer_token = "stale-table-key"
             "tokens": { "account_id": "acct-meta-only" }
         })));
         assert!(!codex_auth_has_credential_login_material(&json!({})));
+    }
+
+    #[test]
+    fn chatgpt_login_material_requires_oauth_tokens() {
+        assert!(codex_auth_has_chatgpt_login_material(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "refresh_token": "refresh" }
+        })));
+        assert!(codex_auth_has_chatgpt_login_material(&json!({
+            "tokens": { "access_token": "access" }
+        })));
+        assert!(!codex_auth_has_chatgpt_login_material(&json!({
+            "auth_mode": "apikey",
+            "tokens": { "access_token": "access" }
+        })));
+        assert!(!codex_auth_has_chatgpt_login_material(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "account_id": "metadata-only" }
+        })));
+        assert!(!codex_auth_has_chatgpt_login_material(&json!({
+            "OPENAI_API_KEY": "sk-third-party"
+        })));
+    }
+
+    #[test]
+    fn chatgpt_proxy_auth_replaces_provider_bearer_and_round_trips() {
+        let input = r#"model_provider = "custom"
+experimental_bearer_token = "top-level-stale"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+
+        let activated =
+            activate_codex_chatgpt_auth_for_proxy_route(input).expect("activate native auth");
+        let parsed: toml::Value = toml::from_str(&activated).expect("parse activated config");
+        let provider = &parsed["model_providers"]["custom"];
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert!(provider.get("experimental_bearer_token").is_none());
+        assert!(parsed.get("experimental_bearer_token").is_none());
+        assert!(codex_config_active_provider_requires_openai_auth(
+            &activated
+        ));
+
+        let deactivated =
+            deactivate_codex_chatgpt_auth_for_proxy_route(&activated).expect("deactivate");
+        assert!(!codex_config_active_provider_requires_openai_auth(
+            &deactivated
+        ));
     }
 
     #[test]

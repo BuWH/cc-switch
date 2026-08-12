@@ -88,6 +88,37 @@ fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<()
     }
 }
 
+fn append_outbound_credential_headers(
+    ordered_headers: &mut http::HeaderMap,
+    incoming_name: &http::HeaderName,
+    incoming_value: &http::HeaderValue,
+    provider_auth_headers: &[(http::HeaderName, http::HeaderValue)],
+    codex_official_auth_passthrough: bool,
+    saw_auth: &mut bool,
+) -> bool {
+    let name = incoming_name.as_str();
+    if !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("x-api-key")
+        && !name.eq_ignore_ascii_case("x-goog-api-key")
+    {
+        return false;
+    }
+
+    if codex_official_auth_passthrough && name.eq_ignore_ascii_case("authorization") {
+        *saw_auth = true;
+        ordered_headers.append(incoming_name.clone(), incoming_value.clone());
+        return true;
+    }
+
+    if !*saw_auth {
+        *saw_auth = true;
+        for (name, value) in provider_auth_headers {
+            ordered_headers.append(name.clone(), value.clone());
+        }
+    }
+    true
+}
+
 pub struct ForwardResult {
     pub response: ProxyResponse,
     pub provider: Provider,
@@ -2136,28 +2167,20 @@ impl RequestForwarder {
                 continue;
             }
 
-            // --- 认证类 — 用 adapter 提供的认证头替换（在原始位置） ---
-            if key_str.eq_ignore_ascii_case("authorization")
-                || key_str.eq_ignore_ascii_case("x-api-key")
-                || key_str.eq_ignore_ascii_case("x-goog-api-key")
-            {
-                // The built-in Codex official provider deliberately has no
-                // credential in CC Switch. `requires_openai_auth = true` makes
-                // Codex send its native ChatGPT authorization, which must reach
-                // the fixed official upstream unchanged. Other credential
-                // headers are still discarded.
-                if codex_official_auth_passthrough && key_str.eq_ignore_ascii_case("authorization")
-                {
-                    saw_auth = true;
-                    ordered_headers.append(key.clone(), value.clone());
-                    continue;
-                }
-                if !saw_auth {
-                    saw_auth = true;
-                    for (ah_name, ah_value) in &auth_headers {
-                        ordered_headers.append(ah_name.clone(), ah_value.clone());
-                    }
-                }
+            // The built-in Codex official provider deliberately has no
+            // credential in CC Switch. `requires_openai_auth = true` makes
+            // Codex send its native ChatGPT authorization, which must reach
+            // the fixed official upstream unchanged. Every third-party route
+            // replaces that incoming credential with the selected provider's
+            // auth headers.
+            if append_outbound_credential_headers(
+                &mut ordered_headers,
+                key,
+                value,
+                &auth_headers,
+                codex_official_auth_passthrough,
+                &mut saw_auth,
+            ) {
                 continue;
             }
 
@@ -4168,6 +4191,63 @@ mod tests {
                 .get(http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
             Some("copilot")
+        );
+    }
+
+    #[test]
+    fn custom_provider_replaces_codex_chatgpt_authorization() {
+        let mut outbound = HeaderMap::new();
+        let incoming_name = http::header::AUTHORIZATION;
+        let incoming_value = HeaderValue::from_static("Bearer official-token");
+        let provider_auth = vec![(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer custom-token"),
+        )];
+        let mut saw_auth = false;
+
+        assert!(append_outbound_credential_headers(
+            &mut outbound,
+            &incoming_name,
+            &incoming_value,
+            &provider_auth,
+            false,
+            &mut saw_auth,
+        ));
+        assert_eq!(
+            outbound
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer custom-token")
+        );
+        assert!(
+            outbound
+                .get_all(http::header::AUTHORIZATION)
+                .iter()
+                .all(|value| value != HeaderValue::from_static("Bearer official-token")),
+            "ChatGPT authorization must never reach a custom upstream"
+        );
+    }
+
+    #[test]
+    fn official_codex_provider_preserves_chatgpt_authorization() {
+        let mut outbound = HeaderMap::new();
+        let incoming_name = http::header::AUTHORIZATION;
+        let incoming_value = HeaderValue::from_static("Bearer official-token");
+        let mut saw_auth = false;
+
+        assert!(append_outbound_credential_headers(
+            &mut outbound,
+            &incoming_name,
+            &incoming_value,
+            &[],
+            true,
+            &mut saw_auth,
+        ));
+        assert_eq!(
+            outbound
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer official-token")
         );
     }
 

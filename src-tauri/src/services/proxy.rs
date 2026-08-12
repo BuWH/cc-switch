@@ -381,16 +381,23 @@ impl ProxyService {
                 &mut effective_settings,
                 existing_live,
             )?;
+            if let Some(auth) = existing_live.get("auth") {
+                effective_settings["auth"] = auth.clone();
+            }
         }
         let (_, proxy_codex_base_url) = self.build_proxy_urls().await?;
 
-        Self::apply_codex_takeover_fields_for_provider(
+        let use_native_chatgpt_auth = Self::apply_codex_takeover_fields_for_provider(
             &mut effective_settings,
             &proxy_codex_base_url,
             provider,
         )?;
 
-        self.write_codex_takeover_live_for_provider(&effective_settings, Some(provider))?;
+        self.write_codex_takeover_live_for_provider(
+            &effective_settings,
+            Some(provider),
+            use_native_chatgpt_auth,
+        )?;
         Ok(())
     }
 
@@ -1571,13 +1578,17 @@ impl ProxyService {
         // Codex: project the selected provider through the local Responses endpoint.
         if let Ok(mut live_config) = self.read_codex_live() {
             let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
-            Self::apply_codex_takeover_fields_for_provider(
+            let use_native_chatgpt_auth = Self::apply_codex_takeover_fields_for_provider(
                 &mut live_config,
                 &proxy_codex_base_url,
                 &codex_provider,
             )?;
 
-            self.write_codex_takeover_live_for_provider(&live_config, Some(&codex_provider))?;
+            self.write_codex_takeover_live_for_provider(
+                &live_config,
+                Some(&codex_provider),
+                use_native_chatgpt_auth,
+            )?;
             log::info!("Codex Live 配置已接管，代理地址: {proxy_codex_base_url}");
         }
 
@@ -1633,13 +1644,17 @@ impl ProxyService {
             AppType::Codex => {
                 let mut live_config = self.read_codex_live()?;
                 let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
-                Self::apply_codex_takeover_fields_for_provider(
+                let use_native_chatgpt_auth = Self::apply_codex_takeover_fields_for_provider(
                     &mut live_config,
                     &proxy_codex_base_url,
                     &codex_provider,
                 )?;
 
-                self.write_codex_takeover_live_for_provider(&live_config, Some(&codex_provider))?;
+                self.write_codex_takeover_live_for_provider(
+                    &live_config,
+                    Some(&codex_provider),
+                    use_native_chatgpt_auth,
+                )?;
                 log::info!("Codex Live 配置已接管，代理地址: {proxy_codex_base_url}");
             }
             AppType::Gemini => {
@@ -1710,7 +1725,7 @@ impl ProxyService {
             AppType::Codex => {
                 if let Ok(mut live_config) = self.read_codex_live() {
                     let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
-                    Self::apply_codex_takeover_fields_for_provider(
+                    let use_native_chatgpt_auth = Self::apply_codex_takeover_fields_for_provider(
                         &mut live_config,
                         &proxy_codex_base_url,
                         &codex_provider,
@@ -1719,6 +1734,7 @@ impl ProxyService {
                     self.write_codex_takeover_live_for_provider(
                         &live_config,
                         Some(&codex_provider),
+                        use_native_chatgpt_auth,
                     )?;
                 }
             }
@@ -2118,7 +2134,16 @@ impl ProxyService {
         }
 
         if let Some(cfg_str) = config.get("config").and_then(|v| v.as_str()) {
-            let updated = Self::remove_local_toml_base_url(cfg_str);
+            let native_auth_proxy_route =
+                crate::codex_config::codex_config_active_provider_requires_openai_auth(cfg_str)
+                    && Self::codex_config_has_base_url_matching(cfg_str, Self::is_local_proxy_url);
+            let updated = if native_auth_proxy_route {
+                crate::codex_config::deactivate_codex_chatgpt_auth_for_proxy_route(cfg_str)
+                    .map_err(|e| format!("清理 Codex 原生认证接管失败: {e}"))?
+            } else {
+                cfg_str.to_string()
+            };
+            let updated = Self::remove_local_toml_base_url(&updated);
             let updated =
                 crate::codex_config::remove_codex_experimental_bearer_token_if(&updated, |token| {
                     token == PROXY_TOKEN_PLACEHOLDER
@@ -2286,6 +2311,17 @@ impl ProxyService {
                 .get("config")
                 .and_then(|v| v.as_str())
                 .is_some_and(crate::codex_config::codex_config_has_official_proxy_route)
+            || config
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|config_text| {
+                    crate::codex_config::codex_config_active_provider_requires_openai_auth(
+                        config_text,
+                    ) && Self::codex_config_has_base_url_matching(
+                        config_text,
+                        Self::is_local_proxy_url,
+                    )
+                })
     }
 
     fn is_gemini_live_taken_over(config: &Value) -> bool {
@@ -2781,21 +2817,37 @@ impl ProxyService {
         settings: &mut Value,
         proxy_base_url: &str,
         provider: &Provider,
-    ) -> Result<(), String> {
-        Self::apply_codex_takeover_auth_placeholder(settings, Some(provider));
+    ) -> Result<bool, String> {
+        let use_native_chatgpt_auth =
+            !crate::proxy::providers::is_codex_official_provider(provider)
+                && settings
+                    .get("auth")
+                    .is_some_and(crate::codex_config::codex_auth_has_chatgpt_login_material);
+        if !use_native_chatgpt_auth {
+            Self::apply_codex_takeover_auth_placeholder(settings, Some(provider));
+        }
         let config_text = settings
             .get("config")
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string();
-        let projected = Self::apply_codex_proxy_toml_config_for_provider(
+        let mut projected = Self::apply_codex_proxy_toml_config_for_provider(
             &config_text,
             proxy_base_url,
             Some(provider),
         )?;
+        if use_native_chatgpt_auth {
+            projected =
+                crate::codex_config::activate_codex_chatgpt_auth_for_proxy_route(&projected)
+                    .map_err(|e| format!("激活 Codex ChatGPT 登录失败: {e}"))?;
+        } else if !crate::proxy::providers::is_codex_official_provider(provider) {
+            projected =
+                crate::codex_config::deactivate_codex_chatgpt_auth_for_proxy_route(&projected)
+                    .map_err(|e| format!("停用 Codex ChatGPT 登录失败: {e}"))?;
+        }
         settings["config"] = json!(projected);
         Self::attach_codex_model_catalog_from_provider(settings, Some(provider));
-        Ok(())
+        Ok(use_native_chatgpt_auth)
     }
 
     fn attach_codex_model_catalog_from_provider(
@@ -2915,6 +2967,7 @@ impl ProxyService {
         &self,
         config: &Value,
         provider: Option<&Provider>,
+        use_native_chatgpt_auth: bool,
     ) -> Result<(), String> {
         let official_passthrough =
             provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
@@ -2922,11 +2975,11 @@ impl ProxyService {
             .get("auth")
             .is_some_and(Self::codex_auth_has_proxy_placeholder);
 
-        // Takeover must never overwrite Codex's long-lived ChatGPT login. For
-        // third-party providers the placeholder is moved into config.toml; for
-        // codex-official no placeholder is needed because requires_openai_auth
-        // makes Codex supply its native authorization.
-        if official_passthrough || placeholder_auth {
+        // Takeover must never overwrite Codex's long-lived ChatGPT login.
+        // Third-party routes either keep native ChatGPT auth active (when the
+        // login exists) or move the proxy placeholder into config.toml.
+        // codex-official always uses native authorization.
+        if official_passthrough || placeholder_auth || use_native_chatgpt_auth {
             let config_str = config.get("config").and_then(|v| v.as_str()).unwrap_or("");
             let profile = provider
                 .map(crate::proxy::providers::resolve_codex_catalog_tool_profile)
@@ -2936,7 +2989,7 @@ impl ProxyService {
                     config, config_str, profile,
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-            let live_config = if official_passthrough {
+            let live_config = if official_passthrough || use_native_chatgpt_auth {
                 prepared_config
             } else {
                 crate::codex_config::prepare_codex_provider_live_config(
@@ -4022,12 +4075,13 @@ wire_api = "responses"
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read live config");
         assert!(
-            live_config.contains(PROXY_TOKEN_PLACEHOLDER),
-            "takeover placeholder should move into config.toml"
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config),
+            "takeover should keep Codex native ChatGPT auth active"
         );
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
         assert!(
             service.detect_takeover_in_live_config_for_app(&AppType::Codex),
-            "Codex takeover detection should recognize config.toml placeholders"
+            "Codex takeover detection should recognize native-auth proxy routes"
         );
 
         crate::settings::update_settings(crate::settings::AppSettings::default())
@@ -4108,9 +4162,10 @@ wire_api = "responses"
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read live config");
         assert!(
-            live_config.contains(PROXY_TOKEN_PLACEHOLDER),
-            "takeover placeholder should move into config.toml"
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config),
+            "takeover should keep Codex native ChatGPT auth active"
         );
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
 
         crate::settings::update_settings(crate::settings::AppSettings::default())
             .expect("reset settings");
@@ -4202,7 +4257,12 @@ wire_api = "responses"
         let third_party_live =
             std::fs::read_to_string(crate::codex_config::get_codex_config_path())
                 .expect("read third-party takeover config");
-        assert!(third_party_live.contains(PROXY_TOKEN_PLACEHOLDER));
+        assert!(
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(
+                &third_party_live
+            )
+        );
+        assert!(!third_party_live.contains(PROXY_TOKEN_PLACEHOLDER));
         assert!(!crate::codex_config::codex_config_has_official_proxy_route(
             &third_party_live
         ));
@@ -4623,9 +4683,10 @@ wire_api = "responses"
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read live config");
         assert!(
-            live_config.contains(PROXY_TOKEN_PLACEHOLDER),
-            "activation-time provider sync must keep the proxy bearer placeholder"
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config),
+            "activation-time provider sync must keep native ChatGPT auth active"
         );
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
         assert!(
             live_config.contains("http://127.0.0.1"),
             "activation-time provider sync must keep the local proxy base_url"
@@ -4748,9 +4809,10 @@ wire_api = "responses"
             "stale enabled takeover must be rebuilt to the current proxy base_url"
         );
         assert!(
-            live_config.contains(PROXY_TOKEN_PLACEHOLDER),
-            "rebuilt takeover should keep the proxy bearer placeholder"
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config),
+            "rebuilt takeover should keep native ChatGPT auth active"
         );
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
         assert!(
             service
                 .live_takeover_matches_current_proxy(&AppType::Codex)
@@ -4861,9 +4923,10 @@ wire_api = "responses"
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read live config");
         assert!(
-            live_config.contains(PROXY_TOKEN_PLACEHOLDER),
-            "third-party takeover should carry its local placeholder in config.toml"
+            crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config),
+            "third-party takeover should keep native ChatGPT auth active"
         );
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
 
         crate::settings::update_settings(crate::settings::AppSettings::default())
             .expect("reset settings");
@@ -4926,6 +4989,59 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(
             !live_config.contains("http://127.0.0.1:15721"),
             "cleanup should remove local proxy base_url"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_takeover_cleanup_removes_native_auth_proxy_projection() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let oauth_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "oauth-id",
+                "access_token": "oauth-access"
+            }
+        });
+        crate::codex_config::write_codex_live_atomic(
+            &oauth_auth,
+            Some(
+                r#"model_provider = "deepseek"
+model = "deepseek-v4-flash"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+            ),
+        )
+        .expect("seed native-auth takeover config");
+
+        assert!(
+            service.detect_takeover_in_live_config_for_app(&AppType::Codex),
+            "native-auth local route should be detected as takeover"
+        );
+
+        service
+            .cleanup_codex_takeover_placeholders_in_live()
+            .expect("cleanup native-auth takeover");
+
+        let live_auth: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read live auth");
+        assert_eq!(live_auth, oauth_auth);
+
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read cleaned config");
+        assert!(!live_config.contains("http://127.0.0.1:15721"));
+        assert!(
+            !crate::codex_config::codex_config_active_provider_requires_openai_auth(&live_config)
         );
     }
 
@@ -5093,6 +5209,46 @@ wire_api = "chat"
         assert_eq!(
             provider.get("wire_api").and_then(|v| v.as_str()),
             Some("responses")
+        );
+    }
+
+    #[test]
+    fn codex_takeover_without_chatgpt_login_keeps_provider_placeholder_mode() {
+        let mut provider = Provider::with_id(
+            "custom".to_string(),
+            "Custom".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "provider-key" },
+                "config": r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+        let mut settings = provider.settings_config.clone();
+
+        let use_native_chatgpt_auth = ProxyService::apply_codex_takeover_fields_for_provider(
+            &mut settings,
+            "http://127.0.0.1:15721/v1",
+            &provider,
+        )
+        .expect("apply takeover");
+
+        assert!(!use_native_chatgpt_auth);
+        assert_eq!(
+            settings["auth"]["OPENAI_API_KEY"].as_str(),
+            Some(PROXY_TOKEN_PLACEHOLDER)
+        );
+        let config = settings["config"].as_str().expect("projected config");
+        assert!(
+            !crate::codex_config::codex_config_active_provider_requires_openai_auth(config),
+            "provider placeholder mode must not ask Codex for ChatGPT auth"
         );
     }
 

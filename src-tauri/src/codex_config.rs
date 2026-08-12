@@ -2220,6 +2220,26 @@ pub fn activate_codex_chatgpt_auth_for_proxy_route(config_text: &str) -> Result<
     provider_table.insert("requires_openai_auth", toml_edit::value(true));
     provider_table.remove("experimental_bearer_token");
     doc.as_table_mut().remove("experimental_bearer_token");
+
+    if doc
+        .get("features")
+        .is_none_or(|item| item.as_table_like().is_none())
+    {
+        if doc.get("features").is_some_and(|item| !item.is_none()) {
+            log::warn!("config.toml 的 features 不是表，已重置为空表");
+        }
+        doc["features"] = toml_edit::table();
+    }
+    if let Some(features) = doc
+        .get_mut("features")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        // `requires_openai_auth` keeps the ChatGPT account visible to Desktop,
+        // while this feature starts the remote-control websocket worker after
+        // Codex restarts under the custom proxy provider.
+        features.insert("remote_control", toml_edit::value(true));
+    }
+
     Ok(doc.to_string())
 }
 
@@ -2885,6 +2905,9 @@ experimental_bearer_token = "stale-table-key"
         let input = r#"model_provider = "custom"
 experimental_bearer_token = "top-level-stale"
 
+[features]
+goals = true
+
 [model_providers.custom]
 name = "Custom"
 base_url = "http://127.0.0.1:15721/v1"
@@ -2904,6 +2927,21 @@ experimental_bearer_token = "PROXY_MANAGED"
         );
         assert!(provider.get("experimental_bearer_token").is_none());
         assert!(parsed.get("experimental_bearer_token").is_none());
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|value| value.get("remote_control"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|value| value.get("goals"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "existing feature flags must survive remote-control activation"
+        );
         assert!(codex_config_active_provider_requires_openai_auth(
             &activated
         ));

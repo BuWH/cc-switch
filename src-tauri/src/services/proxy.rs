@@ -1785,7 +1785,7 @@ impl ProxyService {
                 if let Ok(Some(backup)) = self.db.get_live_backup("codex").await {
                     let config: Value = serde_json::from_str(&backup.original_config)
                         .map_err(|e| format!("解析 Codex 备份失败: {e}"))?;
-                    self.write_codex_live(&config)?;
+                    self.write_codex_live_from_backup(&config)?;
                     log::info!("Codex Live 配置已恢复");
                 }
             }
@@ -1907,7 +1907,7 @@ impl ProxyService {
     fn write_live_config_for_app(&self, app_type: &AppType, config: &Value) -> Result<(), String> {
         match app_type {
             AppType::Claude => self.write_claude_live(config),
-            AppType::Codex => self.write_codex_live(config),
+            AppType::Codex => self.write_codex_live_from_backup(config),
             AppType::Gemini => self.write_gemini_live(config),
             AppType::GrokBuild => self.write_grok_live(config),
             _ => Err("该应用不支持代理功能".to_string()),
@@ -2915,6 +2915,45 @@ impl ProxyService {
         self.write_codex_live_verbatim(config)
     }
 
+    fn prepare_codex_verbatim_config(config: &Value) -> Result<Option<String>, String> {
+        let config_str = config.get("config").and_then(|v| v.as_str());
+
+        // A stored Codex backup comes in two shapes needing opposite handling:
+        // snapshot backups already carry the live model_catalog_json pointer,
+        // while provider-rebuilt backups carry an inline modelCatalog that must
+        // be projected back to config.toml.
+        config_str
+            .map(|cfg| {
+                crate::codex_config::prepare_codex_live_config_text_with_optional_catalog(
+                    config,
+                    cfg,
+                    crate::codex_config::CodexCatalogToolProfile::ProxyChat,
+                )
+            })
+            .transpose()
+            .map_err(|e| format!("写入 Codex 配置失败: {e}"))
+    }
+
+    fn write_codex_live_from_backup(&self, config: &Value) -> Result<(), String> {
+        let auth_path = crate::codex_config::get_codex_auth_path();
+        let preserve_live_oauth = auth_path.exists()
+            && read_json_file(&auth_path)
+                .ok()
+                .as_ref()
+                .is_some_and(crate::codex_config::codex_auth_has_chatgpt_login_material);
+
+        if preserve_live_oauth {
+            if let Some(cfg) = Self::prepare_codex_verbatim_config(config)? {
+                crate::codex_config::write_codex_live_config_atomic(Some(&cfg))
+                    .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+            }
+            log::info!("Codex Live 配置恢复时保留当前 ChatGPT OAuth 登录");
+            return Ok(());
+        }
+
+        self.write_codex_live_verbatim(config)
+    }
+
     fn write_codex_live_for_provider(
         &self,
         config: &Value,
@@ -3010,7 +3049,6 @@ impl ProxyService {
         use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
 
         let auth = config.get("auth");
-        let config_str = config.get("config").and_then(|v| v.as_str());
 
         // Decide the config.toml text ONCE, before splitting on auth. A stored
         // Codex backup comes in two shapes needing opposite handling:
@@ -3031,16 +3069,7 @@ impl ProxyService {
         // modelCatalog but would not get apply_patch re-stripped until the next
         // provider switch rewrites it via write_live_snapshot. Acceptable known
         // limitation (restore-of-deleted-provider-backup only).
-        let prepared_cfg = config_str
-            .map(|cfg| {
-                crate::codex_config::prepare_codex_live_config_text_with_optional_catalog(
-                    config,
-                    cfg,
-                    crate::codex_config::CodexCatalogToolProfile::ProxyChat,
-                )
-            })
-            .transpose()
-            .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+        let prepared_cfg = Self::prepare_codex_verbatim_config(config)?;
 
         match (auth, prepared_cfg.as_deref()) {
             (Some(auth), Some(cfg)) => {
@@ -6925,6 +6954,76 @@ requires_openai_auth = true
     }
 
     /// Regression: turning proxy takeover off restores Live from the backup. The
+    /// backup may be older than Codex's current OAuth state because Codex rotates
+    /// refresh tokens independently. Restoring that stale auth would invalidate
+    /// the fresh login and force the user to sign in again.
+    #[tokio::test]
+    #[serial]
+    async fn codex_restore_from_backup_preserves_current_chatgpt_oauth() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let fresh_oauth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "fresh-id-token",
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token"
+            },
+            "last_refresh": "2026-08-12T08:44:36Z"
+        });
+        crate::codex_config::write_codex_live_atomic(
+            &fresh_oauth,
+            Some("model = \"stale-live-model\"\n"),
+        )
+        .expect("seed fresh live OAuth");
+
+        let restored_config = "model_provider = \"github_copilot\"\n\
+                               model = \"gpt-5.4\"\n\n\
+                               [model_providers.github_copilot]\n\
+                               name = \"GitHub Copilot\"\n\
+                               base_url = \"https://api.enterprise.githubcopilot.com\"\n\
+                               wire_api = \"responses\"\n\
+                               requires_openai_auth = true\n\n\
+                               [features]\n\
+                               remote_control = true\n";
+        let backup_json = serde_json::to_string(&json!({
+            "auth": {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "stale-id-token",
+                    "access_token": "stale-access-token",
+                    "refresh_token": "already-used-refresh-token"
+                },
+                "last_refresh": "2026-07-10T06:02:31Z"
+            },
+            "config": restored_config
+        }))
+        .expect("serialize stale backup");
+        db.save_live_backup("codex", &backup_json)
+            .await
+            .expect("seed stale live backup");
+
+        service
+            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .await
+            .expect("restore codex live from backup");
+
+        let live_auth: Value =
+            read_json_file(&crate::codex_config::get_codex_auth_path()).expect("read live auth");
+        assert_eq!(
+            live_auth, fresh_oauth,
+            "backup restore must not overwrite Codex's freshly rotated OAuth tokens"
+        );
+
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored config.toml");
+        assert_eq!(live_config, restored_config);
+    }
+
+    /// Regression: turning proxy takeover off restores Live from the backup. The
     /// backup snapshot is `read_codex_live_settings()` output (`{auth, config}`,
     /// never an inline `modelCatalog`). The restore must NOT route the config
     /// through catalog projection, which would see no specs and strip the
@@ -6985,6 +7084,12 @@ requires_openai_auth = true
         assert!(
             restored.contains(pointer.as_str()),
             "restored pointer must still reference the cc-switch generated catalog file"
+        );
+        let restored_auth: Value = read_json_file(&crate::codex_config::get_codex_auth_path())
+            .expect("read restored auth");
+        assert_eq!(
+            restored_auth["OPENAI_API_KEY"], "deepseek-key",
+            "without a live ChatGPT OAuth login, restore must still recover backup API-key auth"
         );
     }
 

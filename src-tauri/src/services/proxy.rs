@@ -4263,6 +4263,16 @@ wire_api = "responses"
             )
         );
         assert!(!third_party_live.contains(PROXY_TOKEN_PLACEHOLDER));
+        let third_party_toml: toml::Value =
+            toml::from_str(&third_party_live).expect("parse third-party takeover config");
+        assert_eq!(
+            third_party_toml
+                .get("features")
+                .and_then(|features| features.get("remote_control"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "third-party takeover must restart Codex with remote control enabled"
+        );
         assert!(!crate::codex_config::codex_config_has_official_proxy_route(
             &third_party_live
         ));
@@ -4927,6 +4937,15 @@ wire_api = "responses"
             "third-party takeover should keep native ChatGPT auth active"
         );
         assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
+        let live_toml: toml::Value = toml::from_str(&live_config).expect("parse takeover config");
+        assert_eq!(
+            live_toml
+                .get("features")
+                .and_then(|features| features.get("remote_control"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "remote-control worker feature must survive a Codex restart"
+        );
 
         crate::settings::update_settings(crate::settings::AppSettings::default())
             .expect("reset settings");

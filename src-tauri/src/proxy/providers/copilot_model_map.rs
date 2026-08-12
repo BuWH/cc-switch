@@ -111,19 +111,40 @@ fn dashes_to_dot_in_last_version(id: &str) -> Option<String> {
 /// 返回 `None` 表示无需变换或无可降级的 family 候选（保留原 ID 让上游决定，
 /// 让用户拿到明确的 `model_not_supported` 而非被静默替换）。
 pub fn resolve_against_models(client_id: &str, models: &[CopilotModel]) -> Option<String> {
+    resolve_against_models_excluding(client_id, models, &[])
+}
+
+/// 与 [`resolve_against_models`] 相同，但跳过已被实际推理端点拒绝的模型。
+///
+/// Copilot `/models` 偶尔会短暂保留已经无法调用的模型。调用方可把收到
+/// `model_not_supported` 的模型暂时排除，让同 family 的下一档接管。
+pub fn resolve_against_models_excluding(
+    client_id: &str,
+    models: &[CopilotModel],
+    excluded: &[String],
+) -> Option<String> {
     let normalized = normalize_to_copilot_id(client_id);
     let target = normalized.as_deref().unwrap_or(client_id);
 
-    if models.iter().any(|m| m.id.eq_ignore_ascii_case(target)) {
+    if models
+        .iter()
+        .any(|m| m.id.eq_ignore_ascii_case(target) && !is_excluded(&m.id, excluded))
+    {
         return normalized.filter(|s| s != client_id);
     }
 
-    let fallback = family_fallback(target, models)?;
+    let fallback = family_fallback(target, models, excluded)?;
     if fallback.eq_ignore_ascii_case(client_id) {
         None
     } else {
         Some(fallback)
     }
+}
+
+fn is_excluded(id: &str, excluded: &[String]) -> bool {
+    excluded
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(id))
 }
 
 fn detect_family(id: &str) -> Option<&'static str> {
@@ -153,7 +174,7 @@ fn extract_major_minor(id: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-fn family_fallback(target: &str, models: &[CopilotModel]) -> Option<String> {
+fn family_fallback(target: &str, models: &[CopilotModel], excluded: &[String]) -> Option<String> {
     let family = detect_family(target)?;
     let want_1m = target.ends_with("-1m");
 
@@ -162,7 +183,9 @@ fn family_fallback(target: &str, models: &[CopilotModel]) -> Option<String> {
             .iter()
             .filter(|m| {
                 let lower = m.id.to_ascii_lowercase();
-                lower.contains(family) && lower.ends_with("-1m") == require_1m
+                lower.contains(family)
+                    && lower.ends_with("-1m") == require_1m
+                    && !is_excluded(&m.id, excluded)
             })
             .filter_map(|m| extract_major_minor(&m.id).map(|v| (m, v)))
             .max_by_key(|(_, v)| *v)
@@ -370,5 +393,32 @@ mod tests {
     fn resolve_handles_non_claude_target() {
         let models = vec![model("claude-sonnet-4.6")];
         assert_eq!(resolve_against_models("gpt-5", &models), None);
+    }
+
+    #[test]
+    fn resolve_excludes_rejected_model_and_uses_next_family_version() {
+        let models = vec![
+            model("claude-opus-5"),
+            model("claude-opus-4.8-1m"),
+            model("claude-opus-4.8"),
+            model("claude-opus-4.6"),
+        ];
+        let excluded = vec!["claude-opus-5".to_string()];
+
+        assert_eq!(
+            resolve_against_models_excluding("claude-opus-5[1m]", &models, &excluded),
+            Some("claude-opus-4.8-1m".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_exclusion_is_case_insensitive() {
+        let models = vec![model("claude-sonnet-5"), model("claude-sonnet-4.6")];
+        let excluded = vec!["CLAUDE-SONNET-5".to_string()];
+
+        assert_eq!(
+            resolve_against_models_excluding("claude-sonnet-5", &models, &excluded),
+            Some("claude-sonnet-4.6".to_string())
+        );
     }
 }

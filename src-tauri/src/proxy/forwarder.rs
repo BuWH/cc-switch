@@ -34,11 +34,43 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+const COPILOT_REJECTED_MODEL_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn copilot_rejected_models() -> &'static Mutex<std::collections::HashMap<(String, String), Instant>>
+{
+    static REJECTED: OnceLock<Mutex<std::collections::HashMap<(String, String), Instant>>> =
+        OnceLock::new();
+    REJECTED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn temporarily_rejected_copilot_models(provider_id: &str) -> Vec<String> {
+    let now = Instant::now();
+    let mut rejected = copilot_rejected_models()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rejected.retain(|_, rejected_at| now.duration_since(*rejected_at) < COPILOT_REJECTED_MODEL_TTL);
+    rejected
+        .keys()
+        .filter(|(candidate_provider_id, _)| candidate_provider_id == provider_id)
+        .map(|(_, model_id)| model_id.clone())
+        .collect()
+}
+
+fn temporarily_reject_copilot_model(provider_id: &str, model_id: &str) {
+    let mut rejected = copilot_rejected_models()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rejected.insert(
+        (provider_id.to_string(), model_id.to_ascii_lowercase()),
+        Instant::now(),
+    );
+}
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -547,6 +579,102 @@ impl RequestForwarder {
                     });
                 }
                 Err(e) => {
+                    let mut e = e;
+
+                    if is_copilot_model_not_supported_error(provider, &e) {
+                        if let Some(rejected_model) = self
+                            .resolve_copilot_outbound_model(provider, &provider_body)
+                            .await
+                        {
+                            temporarily_reject_copilot_model(&provider.id, &rejected_model);
+                            log::warn!(
+                                "[{app_type_str}] [Copilot] Upstream rejected model={rejected_model}; retrying once with the next live model in the same family"
+                            );
+
+                            match self
+                                .forward(
+                                    app_type,
+                                    &method,
+                                    provider,
+                                    endpoint,
+                                    &provider_body,
+                                    &headers,
+                                    &extensions,
+                                    adapter.as_ref(),
+                                )
+                                .await
+                            {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    codex_converted_to_chat,
+                                )) => {
+                                    log::info!(
+                                        "[{app_type_str}] [Copilot] Model fallback retry succeeded"
+                                    );
+                                    self.record_success_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+
+                                    {
+                                        let mut current_providers =
+                                            self.current_providers.write().await;
+                                        current_providers.insert(
+                                            app_type_str.to_string(),
+                                            (provider.id.clone(), provider.name.clone()),
+                                        );
+                                    }
+
+                                    {
+                                        let mut status = self.status.write().await;
+                                        status.success_requests += 1;
+                                        status.last_error = None;
+                                        let should_switch =
+                                            self.current_provider_id_at_start.as_str()
+                                                != provider.id.as_str();
+                                        if should_switch {
+                                            status.failover_count += 1;
+                                            let fm = self.failover_manager.clone();
+                                            let ah = self.app_handle.clone();
+                                            let pid = provider.id.clone();
+                                            let pname = provider.name.clone();
+                                            let at = app_type_str.to_string();
+                                            tokio::spawn(async move {
+                                                let _ = fm
+                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                    .await;
+                                            });
+                                        }
+                                        if status.total_requests > 0 {
+                                            status.success_rate = (status.success_requests as f32
+                                                / status.total_requests as f32)
+                                                * 100.0;
+                                        }
+                                    }
+
+                                    return Ok(ForwardResult {
+                                        response,
+                                        provider: provider.clone(),
+                                        claude_api_format,
+                                        outbound_model,
+                                        codex_converted_to_chat,
+                                        connection_guard: None,
+                                    });
+                                }
+                                Err(retry_err) => {
+                                    log::warn!(
+                                        "[{app_type_str}] [Copilot] Model fallback retry failed: {retry_err}"
+                                    );
+                                    e = retry_err;
+                                }
+                            }
+                        }
+                    }
+
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -2612,8 +2740,19 @@ impl RequestForwarder {
         };
         let model_id = model_id.to_string();
 
+        if let Some(resolved) = self.resolve_copilot_live_model(provider, &model_id).await {
+            log::info!("[Copilot] live-model resolve: {model_id} → {resolved}");
+            body["model"] = serde_json::Value::String(resolved);
+        }
+    }
+
+    async fn resolve_copilot_live_model(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+    ) -> Option<String> {
         let Some(app_handle) = &self.app_handle else {
-            return;
+            return None;
         };
         let copilot_state = app_handle.state::<CopilotAuthState>();
         let copilot_auth = copilot_state.0.read().await;
@@ -2631,16 +2770,34 @@ impl RequestForwarder {
             Ok(m) => m,
             Err(err) => {
                 log::debug!("[Copilot] live model list unavailable, skip resolution: {err}");
-                return;
+                return None;
             }
         };
 
-        if let Some(resolved) =
-            super::providers::copilot_model_map::resolve_against_models(&model_id, &models)
-        {
-            log::info!("[Copilot] live-model resolve: {model_id} → {resolved}");
-            body["model"] = serde_json::Value::String(resolved);
+        let excluded = temporarily_rejected_copilot_models(&provider.id);
+        if excluded.is_empty() {
+            super::providers::copilot_model_map::resolve_against_models(model_id, &models)
+        } else {
+            super::providers::copilot_model_map::resolve_against_models_excluding(
+                model_id, &models, &excluded,
+            )
         }
+    }
+
+    async fn resolve_copilot_outbound_model(
+        &self,
+        provider: &Provider,
+        body: &Value,
+    ) -> Option<String> {
+        let (mapped_body, _, _) = super::model_mapper::apply_model_mapping(body.clone(), provider);
+        let normalized =
+            super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
+        let model_id = normalized.get("model")?.as_str()?.to_string();
+        Some(
+            self.resolve_copilot_live_model(provider, &model_id)
+                .await
+                .unwrap_or(model_id),
+        )
     }
 
     async fn is_copilot_openai_vendor_model(&self, provider: &Provider, model_id: &str) -> bool {
@@ -2747,6 +2904,33 @@ fn extract_error_message(error: &ProxyError) -> Option<String> {
         ProxyError::UpstreamError { body, .. } => body.clone(),
         _ => Some(error.to_string()),
     }
+}
+
+fn is_copilot_model_not_supported_error(provider: &Provider, error: &ProxyError) -> bool {
+    if !provider.is_github_copilot() {
+        return false;
+    }
+    let ProxyError::UpstreamError {
+        status: 400,
+        body: Some(body),
+    } = error
+    else {
+        return false;
+    };
+
+    if let Ok(json) = serde_json::from_str::<Value>(body) {
+        let code = json.pointer("/error/code").and_then(Value::as_str);
+        let message = json.pointer("/error/message").and_then(Value::as_str);
+        return code.is_some_and(|value| value.eq_ignore_ascii_case("model_not_supported"))
+            || message.is_some_and(|value| {
+                value
+                    .to_ascii_lowercase()
+                    .contains("requested model is not supported")
+            });
+    }
+
+    body.to_ascii_lowercase()
+        .contains("requested model is not supported")
 }
 
 /// 检测 Provider 是否为 Bedrock（通过 CLAUDE_CODE_USE_BEDROCK 环境变量判断）
@@ -3667,6 +3851,37 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn detects_copilot_model_not_supported_error() {
+        let provider = test_provider_with_type(Some("github_copilot"));
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"The requested model is not supported.","code":"model_not_supported"}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(is_copilot_model_not_supported_error(&provider, &error));
+        assert!(!is_copilot_model_not_supported_error(
+            &test_provider_with_type(None),
+            &error
+        ));
+    }
+
+    #[test]
+    fn rejected_copilot_models_are_scoped_by_provider() {
+        let provider_a = "test-copilot-rejection-a";
+        let provider_b = "test-copilot-rejection-b";
+        temporarily_reject_copilot_model(provider_a, "Claude-Opus-5");
+
+        assert_eq!(
+            temporarily_rejected_copilot_models(provider_a),
+            vec!["claude-opus-5".to_string()]
+        );
+        assert!(temporarily_rejected_copilot_models(provider_b).is_empty());
     }
 
     fn test_forwarder(

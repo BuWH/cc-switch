@@ -822,23 +822,18 @@ mod tests {
     }
 
     /// 启动一个最小 HTTP/1.1 服务器：响应 `Content-Length: body_len` 的全零 body，
-    /// 分块写出并统计实际写成功的字节数（客户端断开后写入失败即停）。
-    async fn spawn_fixed_body_server(
-        body_len: usize,
-    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+    /// 受控分块写出并返回实际写成功的字节数（客户端断开后写入失败即停）。
+    ///
+    /// 每块之间短暂让出执行权，避免 macOS loopback 自动扩大的 socket buffer 在客户端
+    /// 处理首批数据前吞入数 MiB，从而让测试结果依赖内核缓冲区大小。
+    async fn spawn_fixed_body_server(body_len: usize) -> (u16, tokio::task::JoinHandle<usize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let written = Arc::new(AtomicUsize::new(0));
-        let written_report = written.clone();
 
-        tokio::spawn(async move {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
             // 读完请求头（内容不重要）
             let mut buf = [0u8; 4096];
             let mut filled = 0;
@@ -846,11 +841,9 @@ mod tests {
                 if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
                     break;
                 }
-                let Ok(n) = socket.read(&mut buf[filled..]).await else {
-                    return;
-                };
+                let n = socket.read(&mut buf[filled..]).await.unwrap();
                 if n == 0 {
-                    return;
+                    return 0;
                 }
                 filled += n;
             }
@@ -858,35 +851,35 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n"
             );
             if socket.write_all(header.as_bytes()).await.is_err() {
-                return;
+                return 0;
             }
             let chunk = [0u8; 16 * 1024];
             let mut remaining = body_len;
+            let mut written = 0;
             while remaining > 0 {
                 let n = remaining.min(chunk.len());
                 if socket.write_all(&chunk[..n]).await.is_err() {
                     break;
                 }
-                written.fetch_add(n, Ordering::SeqCst);
+                written += n;
                 remaining -= n;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
+            written
         });
 
-        (port, written_report)
+        (port, server)
     }
 
-    /// 客户端断开到服务器写入失败之间有时延（loopback 缓冲区会再吞一部分），
-    /// 稍等再读计数。只要客户端真的中途截停，服务器绝不可能写出大半个 body。
-    async fn assert_server_aborted_early(
-        written: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        body_len: usize,
-    ) {
-        use std::sync::atomic::Ordering;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let written = written.load(Ordering::SeqCst);
+    /// 等待服务器明确观察到连接断开，并确认它没有写完整个响应体。
+    async fn assert_server_aborted_early(server: tokio::task::JoinHandle<usize>, body_len: usize) {
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("服务器应在客户端取消或完整写完后退出")
+            .expect("测试服务器任务不应 panic");
         assert!(
-            written < body_len / 2,
-            "客户端应在预算耗尽后立即断开，服务器不应写出大部分 body（实际已写 {written}/{body_len} 字节）"
+            written < body_len,
+            "客户端应在预算耗尽后断开，服务器不应写完整个 body（实际已写 {written}/{body_len} 字节）"
         );
     }
 

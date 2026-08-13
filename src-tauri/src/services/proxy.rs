@@ -785,6 +785,9 @@ impl ProxyService {
                 // live 文件仍停留在普通供应商配置。
                 if has_backup && live_matches_current_proxy {
                     self.refresh_active_target_from_current_provider(&app).await;
+                    if matches!(app, AppType::Codex) {
+                        Self::ensure_codex_remote_daemon_best_effort().await;
+                    }
                     return Ok(());
                 }
                 restore_existing_backup_before_takeover = has_backup;
@@ -840,6 +843,9 @@ impl ProxyService {
             let _ = self.db.set_live_takeover_active(true).await;
 
             self.refresh_active_target_from_current_provider(&app).await;
+            if matches!(app, AppType::Codex) {
+                Self::ensure_codex_remote_daemon_best_effort().await;
+            }
 
             // 8) Warn if the current provider is official (risk of account ban via proxy)
             if let Ok(Some(current_id)) =
@@ -928,6 +934,29 @@ impl ProxyService {
         }
 
         Ok(())
+    }
+
+    async fn ensure_codex_remote_daemon_best_effort() {
+        match crate::services::codex_remote_control::ensure_for_active_proxy().await {
+            Ok(Some(
+                crate::services::codex_remote_control::CodexRemoteDaemonAction::AlreadyRunning,
+            )) => {
+                log::info!("Codex Remote daemon 已运行并启用远程控制");
+            }
+            Ok(Some(
+                crate::services::codex_remote_control::CodexRemoteDaemonAction::Bootstrapped,
+            )) => {
+                log::info!("Codex Remote daemon 已持久化启动并启用远程控制");
+            }
+            Ok(None) => {
+                log::debug!("Codex 当前未使用 ChatGPT OAuth 代理路由，跳过 Remote daemon");
+            }
+            Err(error) => {
+                // Remote Control is auxiliary. A missing/old standalone CLI
+                // must not break model routing through the custom provider.
+                log::warn!("Codex Remote daemon 自动恢复失败: {error}");
+            }
+        }
     }
 
     /// 同步关闭指定应用的 Live 接管（恢复配置并清标志，不停止代理服务）。

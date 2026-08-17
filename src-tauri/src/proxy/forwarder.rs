@@ -1733,6 +1733,20 @@ impl RequestForwarder {
             );
         }
 
+        if is_copilot
+            && matches!(
+                split_endpoint_and_query(&effective_endpoint).0,
+                "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
+            )
+        {
+            let normalized_images = normalize_copilot_responses_image_details(&mut request_body);
+            if normalized_images > 0 {
+                log::debug!(
+                    "[Copilot] Normalized {normalized_images} unsupported Responses image detail value(s) to high"
+                );
+            }
+        }
+
         // Native Responses passthrough to a strict third-party gateway (xAI):
         // flatten Codex's private `namespace`/plugin tool declarations into
         // top-level function tools so the upstream's strict serde parser does
@@ -3483,6 +3497,34 @@ fn raise_copilot_minimal_effort_for_web_search(body: &mut Value) -> bool {
     true
 }
 
+fn normalize_copilot_responses_image_details(value: &mut Value) -> usize {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .map(normalize_copilot_responses_image_details)
+            .sum(),
+        Value::Object(object) => {
+            let mut normalized = 0;
+            if object.get("type").and_then(Value::as_str) == Some("input_image") {
+                let detail_is_supported = object
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .is_some_and(|detail| matches!(detail, "low" | "high"));
+                if object.contains_key("detail") && !detail_is_supported {
+                    object.insert("detail".to_string(), Value::String("high".to_string()));
+                    normalized += 1;
+                }
+            }
+            normalized
+                + object
+                    .values_mut()
+                    .map(normalize_copilot_responses_image_details)
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
 fn build_codex_oauth_session_headers(
     session_id: &str,
 ) -> Vec<(http::HeaderName, http::HeaderValue)> {
@@ -4877,6 +4919,63 @@ mod tests {
 
         assert!(!raise_copilot_minimal_effort_for_web_search(&mut body));
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn copilot_responses_normalizes_unsupported_image_details() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/original.png",
+                            "detail": "original"
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/low.png",
+                            "detail": "low"
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/high.png",
+                            "detail": "high"
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/default.png"
+                        },
+                        {
+                            "type": "input_text",
+                            "text": "keep this field",
+                            "detail": "original"
+                        }
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/auto.png",
+                            "detail": "auto"
+                        }
+                    ]
+                }
+            ],
+            "detail": "request metadata"
+        });
+
+        assert_eq!(normalize_copilot_responses_image_details(&mut body), 2);
+        assert_eq!(body["input"][0]["content"][0]["detail"], "high");
+        assert_eq!(body["input"][0]["content"][1]["detail"], "low");
+        assert_eq!(body["input"][0]["content"][2]["detail"], "high");
+        assert!(body["input"][0]["content"][3].get("detail").is_none());
+        assert_eq!(body["input"][0]["content"][4]["detail"], "original");
+        assert_eq!(body["input"][1]["output"][0]["detail"], "high");
+        assert_eq!(body["detail"], "request metadata");
     }
 
     #[test]

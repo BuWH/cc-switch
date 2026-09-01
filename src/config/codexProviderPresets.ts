@@ -403,7 +403,8 @@ disable_response_storage = true
 [model_providers.github_copilot]
 name = "GitHub Copilot"
 base_url = "https://api.githubcopilot.com"
-wire_api = "chat"`,
+wire_api = "chat"
+requires_openai_auth = false`,
     endpointCandidates: ["https://api.githubcopilot.com"],
     apiFormat: "openai_chat",
     providerType: "github_copilot",

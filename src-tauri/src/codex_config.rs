@@ -7271,6 +7271,8 @@ wire_api = "responses"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning_levels: None,
+            default_reasoning_level: None,
         }];
 
         let catalog = codex_model_catalog_from_specs(

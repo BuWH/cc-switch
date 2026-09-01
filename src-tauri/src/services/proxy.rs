@@ -731,13 +731,22 @@ impl ProxyService {
         )
         .map_err(|e| format!("构建 codex 有效配置失败: {e}"))?
         .settings_config;
+        let target_is_managed_official =
+            crate::proxy::providers::is_codex_official_provider(provider)
+                && provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                    .is_some_and(|account_id| !account_id.trim().is_empty());
         if let Some(existing_live) = existing_live.as_ref() {
             Self::preserve_toml_mcp_servers_from_existing_config(
                 &mut effective_settings,
                 existing_live,
             )?;
-            if let Some(auth) = existing_live.get("auth") {
-                effective_settings["auth"] = auth.clone();
+            if !target_is_managed_official {
+                if let Some(auth) = existing_live.get("auth") {
+                    effective_settings["auth"] = auth.clone();
+                }
             }
         }
         let (_, proxy_codex_base_url) = self.build_proxy_urls().await?;
@@ -8990,6 +8999,22 @@ requires_openai_auth = true
              base_url = \"https://api.deepseek.example/v1\"\n\
              wire_api = \"responses\"\n"
         );
+        let mut provider = Provider::with_id(
+            "custom".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "deepseek-key" },
+                "config": backup_config.clone(),
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+        db.save_provider("codex", &provider)
+            .expect("save current third-party provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("set DB current third-party provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set local current third-party provider");
         let backup_json = serde_json::to_string(&json!({
             "auth": { "OPENAI_API_KEY": "deepseek-key" },
             "config": backup_config,

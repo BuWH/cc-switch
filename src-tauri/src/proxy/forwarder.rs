@@ -591,7 +591,7 @@ impl RequestForwarder {
             }
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
+            let mut result = self
                 .forward(
                     app_type,
                     &method,
@@ -602,8 +602,31 @@ impl RequestForwarder {
                     &extensions,
                     adapter.as_ref(),
                 )
-                .await
+                .await;
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_copilot_endpoint_mismatch_error(provider, error))
+                && self.refresh_copilot_models(provider).await
             {
+                log::info!(
+                    "[{app_type_str}] [Copilot] Retrying once after endpoint mismatch and catalog refresh"
+                );
+                // Rebuild from the original body so a Chat conversion cannot leak into Responses.
+                result = self
+                    .forward(
+                        app_type,
+                        &method,
+                        provider,
+                        endpoint,
+                        &provider_body,
+                        &headers,
+                        &extensions,
+                        adapter.as_ref(),
+                    )
+                    .await;
+            }
+            match result {
                 Ok((response, claude_api_format, outbound_model, codex_converted_to_chat)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -1459,14 +1482,10 @@ impl RequestForwarder {
             // variants pass through unchanged.
             mapped_body =
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
-            // Copilot routes OpenAI-vendor models through Responses, while the
-            // remaining catalog continues to use Chat Completions.
+            // Prefer the catalog's declared endpoints; vendor is only a legacy fallback.
             if codex_responses_to_chat {
                 if let Some(model_id) = mapped_body.get("model").and_then(|v| v.as_str()) {
-                    if self
-                        .is_copilot_openai_vendor_model(provider, model_id)
-                        .await
-                    {
+                    if self.is_copilot_responses_model(provider, model_id).await {
                         codex_responses_to_chat = false;
                     }
                 }
@@ -2861,10 +2880,7 @@ impl RequestForwarder {
 
         let model = body.get("model").and_then(|value| value.as_str());
         if let Some(model_id) = model {
-            if self
-                .is_copilot_openai_vendor_model(provider, model_id)
-                .await
-            {
+            if self.is_copilot_responses_model(provider, model_id).await {
                 return "openai_responses".to_string();
             }
         }
@@ -2873,7 +2889,7 @@ impl RequestForwarder {
     }
 
     /// 用 Copilot live `/models` 列表确认 model ID 真实可用，找不到时按 family 降级。
-    /// 命中缓存后是同步的；首次请求或 5 min 缓存过期后会触发一次 HTTP。
+    /// 目录 24 小时过期；未命中时提前刷新，刷新请求有冷却和并发去重。
     async fn apply_copilot_live_model_resolution(
         &self,
         provider: &Provider,
@@ -2905,10 +2921,10 @@ impl RequestForwarder {
             .as_ref()
             .and_then(|m| m.managed_account_id_for("github_copilot"));
 
-        let models_result = match account_id.as_deref() {
-            Some(id) => copilot_auth.fetch_models_for_account(id).await,
-            None => copilot_auth.fetch_models().await,
-        };
+        let catalog_model_id = super::model_mapper::strip_one_m_suffix_for_upstream(model_id);
+        let models_result = copilot_auth
+            .fetch_models_for_request(account_id.as_deref(), catalog_model_id)
+            .await;
 
         let models = match models_result {
             Ok(m) => m,
@@ -2944,7 +2960,29 @@ impl RequestForwarder {
         )
     }
 
-    async fn is_copilot_openai_vendor_model(&self, provider: &Provider, model_id: &str) -> bool {
+    async fn refresh_copilot_models(&self, provider: &Provider) -> bool {
+        let Some(app_handle) = &self.app_handle else {
+            return false;
+        };
+        let copilot_state = app_handle.state::<CopilotAuthState>();
+        let copilot_auth = copilot_state.0.read().await;
+        let account_id = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("github_copilot"));
+        match copilot_auth
+            .refresh_models_for_request(account_id.as_deref())
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("[Copilot] Endpoint recovery could not refresh model catalog: {error}");
+                false
+            }
+        }
+    }
+
+    async fn is_copilot_responses_model(&self, provider: &Provider, model_id: &str) -> bool {
         let Some(app_handle) = &self.app_handle else {
             log::debug!("[Copilot] AppHandle unavailable, fallback to chat/completions");
             return false;
@@ -2957,26 +2995,25 @@ impl RequestForwarder {
             .as_ref()
             .and_then(|m| m.managed_account_id_for("github_copilot"));
 
-        let vendor_result = match account_id.as_deref() {
-            Some(id) => {
-                copilot_auth
-                    .get_model_vendor_for_account(id, model_id)
-                    .await
-            }
-            None => copilot_auth.get_model_vendor(model_id).await,
-        };
-
-        match vendor_result {
-            Ok(Some(vendor)) => vendor.eq_ignore_ascii_case("openai"),
-            Ok(None) => {
+        match copilot_auth
+            .fetch_models_for_request(account_id.as_deref(), model_id)
+            .await
+        {
+            Ok(models) => {
+                if let Some(model) = models
+                    .iter()
+                    .find(|model| model.id.eq_ignore_ascii_case(model_id))
+                {
+                    return model.uses_responses_api();
+                }
                 log::debug!(
-                    "[Copilot] Model vendor unavailable for {model_id}, fallback to chat/completions"
+                    "[Copilot] Model metadata unavailable for {model_id}, fallback to chat/completions"
                 );
                 false
             }
             Err(err) => {
                 log::warn!(
-                    "[Copilot] Failed to resolve model vendor for {model_id}, fallback to chat/completions: {err}"
+                    "[Copilot] Failed to resolve model metadata for {model_id}, fallback to chat/completions: {err}"
                 );
                 false
             }
@@ -3041,7 +3078,38 @@ fn extract_error_message(error: &ProxyError) -> Option<String> {
     }
 }
 
+fn is_copilot_endpoint_mismatch_error(provider: &Provider, error: &ProxyError) -> bool {
+    if !provider.is_github_copilot() {
+        return false;
+    }
+    let ProxyError::UpstreamError {
+        status: 400,
+        body: Some(body),
+    } = error
+    else {
+        return false;
+    };
+    let json = serde_json::from_str::<Value>(body).ok();
+    let message = json
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or(body)
+        .to_ascii_lowercase();
+    message.contains("is not accessible via the")
+        && message.contains("endpoint")
+        && (message.contains("/chat/completions") || message.contains("/responses"))
+}
+
 fn is_copilot_model_not_supported_error(provider: &Provider, error: &ProxyError) -> bool {
+    // A supported model on the wrong endpoint must not be blacklisted or downgraded.
+    if is_copilot_endpoint_mismatch_error(provider, error) {
+        return false;
+    }
     if !provider.is_github_copilot() {
         return false;
     }
@@ -4093,6 +4161,57 @@ mod tests {
             &test_provider_with_type(None),
             &error
         ));
+    }
+
+    #[test]
+    fn detects_copilot_endpoint_mismatch_without_rejecting_model() {
+        let provider = test_provider_with_type(Some("github_copilot"));
+        for message in [
+            r#"model "gpt-6-astra" is not accessible via the /chat/completions endpoint"#,
+            r#"model "legacy" is not accessible via the /responses endpoint"#,
+        ] {
+            for body in [
+                message.to_string(),
+                serde_json::json!({
+                    "error": {"message": message, "code": "model_not_supported"}
+                })
+                .to_string(),
+            ] {
+                let error = ProxyError::UpstreamError {
+                    status: 400,
+                    body: Some(body),
+                };
+                assert!(is_copilot_endpoint_mismatch_error(&provider, &error));
+                assert!(!is_copilot_model_not_supported_error(&provider, &error));
+                assert!(!is_copilot_endpoint_mismatch_error(
+                    &test_provider_with_type(None),
+                    &error
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_upstream_errors_do_not_trigger_catalog_refresh() {
+        let provider = test_provider_with_type(Some("github_copilot"));
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":{"message":"Invalid input","code":"invalid_request"}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"The requested model is not supported.","code":"model_not_supported"}}"#,
+            ),
+            (429, "model is not accessible via the /responses endpoint"),
+            (500, "model is not accessible via the /responses endpoint"),
+        ] {
+            let error = ProxyError::UpstreamError {
+                status,
+                body: Some(body.to_string()),
+            };
+            assert!(!is_copilot_endpoint_mismatch_error(&provider, &error));
+        }
     }
 
     #[test]

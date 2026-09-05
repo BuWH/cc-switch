@@ -21,6 +21,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 /// GitHub OAuth 客户端 ID（VS Code）- 用于 github.com
@@ -90,6 +91,10 @@ fn copilot_api_base(domain: &str) -> String {
 
 /// Token 刷新提前量（秒）
 const TOKEN_REFRESH_BUFFER_SECONDS: i64 = 60;
+
+const MODELS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MODELS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+const MODELS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 判断是否为 GitHub Enterprise Server（非 github.com）
 fn is_ghes(domain: &str) -> bool {
@@ -198,21 +203,47 @@ pub struct CopilotModel {
     pub vendor: String,
     /// 是否在模型选择器中显示
     pub model_picker_enabled: bool,
+    /// 上游声明的端点；旧目录可能不包含此字段
+    #[serde(default)]
+    pub supported_endpoints: Vec<String>,
+}
+
+impl CopilotModel {
+    pub fn uses_responses_api(&self) -> bool {
+        if self.supported_endpoints.is_empty() {
+            return self.vendor.eq_ignore_ascii_case("openai");
+        }
+        self.supported_endpoints
+            .iter()
+            .any(|endpoint| endpoint == "/responses" || endpoint == "/v1/responses")
+    }
+}
+
+#[derive(Default)]
+struct CopilotModelsCache {
+    models: Option<Vec<CopilotModel>>,
+    fetched_at: Option<Instant>,
+    last_attempt: Option<Instant>,
+    last_error: Option<String>,
+}
+
+impl CopilotModelsCache {
+    fn needs_refresh(&self, required_model: Option<&str>, force_refresh: bool) -> bool {
+        force_refresh
+            || self
+                .fetched_at
+                .is_none_or(|fetched_at| fetched_at.elapsed() >= MODELS_CACHE_TTL)
+            || self.models.as_ref().is_none_or(|models| {
+                required_model
+                    .is_some_and(|id| !models.iter().any(|model| model.id.eq_ignore_ascii_case(id)))
+            })
+    }
 }
 
 /// Copilot Models API 响应
 #[derive(Debug, Deserialize)]
 struct CopilotModelsResponse {
-    data: Vec<CopilotModelsResponseItem>,
-}
-
-/// Copilot Models API 响应项
-#[derive(Debug, Deserialize)]
-struct CopilotModelsResponseItem {
-    id: String,
-    name: String,
-    vendor: String,
-    model_picker_enabled: bool,
+    data: Vec<CopilotModel>,
 }
 
 /// Copilot 认证错误
@@ -422,8 +453,8 @@ pub struct CopilotAuthManager {
     refresh_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// Copilot Token 缓存（key = GitHub user ID，内存缓存，自动刷新）
     copilot_tokens: Arc<RwLock<HashMap<String, CopilotToken>>>,
-    /// Copilot Models 缓存（key = GitHub user ID，仅进程内复用）
-    copilot_models: Arc<RwLock<HashMap<String, Vec<CopilotModel>>>>,
+    /// 每账号模型目录与刷新锁；24 小时过期，未命中和端点错误可提前刷新
+    copilot_models: Arc<RwLock<HashMap<String, Arc<Mutex<CopilotModelsCache>>>>>,
     /// Copilot API 端点缓存（key = GitHub user ID，从 /copilot_internal/user 获取）
     api_endpoints: Arc<RwLock<HashMap<String, String>>>,
     /// 每个账号的端点拉取锁，避免并发拉取重复打 GitHub API
@@ -798,21 +829,117 @@ impl CopilotAuthManager {
         &self,
         account_id: &str,
     ) -> Result<Vec<CopilotModel>, CopilotAuthError> {
-        self.ensure_migration_complete().await?;
+        Ok(self
+            .load_models_for_account(account_id, None, false)
+            .await?
+            .into_iter()
+            .filter(|model| model.model_picker_enabled)
+            .collect())
+    }
 
-        {
-            let models = self.copilot_models.read().await;
-            if let Some(cached) = models.get(account_id) {
-                return Ok(cached.clone());
+    /// 请求路径保留隐藏模型的路由元数据，并在模型未命中时提前刷新。
+    pub async fn fetch_models_for_request(
+        &self,
+        account_id: Option<&str>,
+        model_id: &str,
+    ) -> Result<Vec<CopilotModel>, CopilotAuthError> {
+        let account_id = self.model_account_id(account_id).await?;
+        self.load_models_for_account(&account_id, Some(model_id), false)
+            .await
+    }
+
+    /// 端点不匹配时重新获取目录；与未命中刷新共用冷却时间及并发锁。
+    pub async fn refresh_models_for_request(
+        &self,
+        account_id: Option<&str>,
+    ) -> Result<(), CopilotAuthError> {
+        let account_id = self.model_account_id(account_id).await?;
+        self.load_models_for_account(&account_id, None, true)
+            .await?;
+        Ok(())
+    }
+
+    async fn model_account_id(&self, account_id: Option<&str>) -> Result<String, CopilotAuthError> {
+        self.ensure_migration_complete().await?;
+        match account_id {
+            Some(id) => Ok(id.to_string()),
+            None => self
+                .resolve_default_account_id()
+                .await
+                .ok_or(CopilotAuthError::GitHubTokenInvalid),
+        }
+    }
+
+    async fn load_models_for_account(
+        &self,
+        account_id: &str,
+        required_model: Option<&str>,
+        force_refresh: bool,
+    ) -> Result<Vec<CopilotModel>, CopilotAuthError> {
+        self.ensure_migration_complete().await?;
+        let entry = {
+            let accounts = self.accounts.read().await;
+            if !accounts.contains_key(account_id) {
+                return Err(CopilotAuthError::AccountNotFound(account_id.to_string()));
+            }
+            let mut caches = self.copilot_models.write().await;
+            caches
+                .entry(account_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(CopilotModelsCache::default())))
+                .clone()
+        };
+        // Hold only this account's lock across I/O so concurrent misses share one fetch.
+        let mut cache = entry.lock().await;
+        let cooling_down = cache
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < MODELS_REFRESH_COOLDOWN);
+        if force_refresh && cooling_down {
+            if let Some(error) = &cache.last_error {
+                return Err(CopilotAuthError::CopilotTokenFetchFailed(error.clone()));
             }
         }
-
-        let models = self.fetch_models_for_account_uncached(account_id).await?;
-        {
-            let mut cache = self.copilot_models.write().await;
-            cache.insert(account_id.to_string(), models.clone());
+        if !cache.needs_refresh(required_model, force_refresh) || cooling_down {
+            return cache.models.clone().ok_or_else(|| {
+                CopilotAuthError::CopilotTokenFetchFailed(
+                    cache
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "模型目录刷新冷却中，请稍后重试".to_string()),
+                )
+            });
         }
-        Ok(models)
+
+        cache.last_attempt = Some(Instant::now());
+        let result = tokio::time::timeout(
+            MODELS_FETCH_TIMEOUT,
+            self.fetch_models_for_account_uncached(account_id),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(CopilotAuthError::NetworkError(
+                "获取 Copilot 模型目录超时".to_string(),
+            ))
+        });
+        cache.last_attempt = Some(Instant::now());
+        match result {
+            Ok(models) => {
+                cache.models = Some(models.clone());
+                cache.fetched_at = Some(Instant::now());
+                cache.last_error = None;
+                Ok(models)
+            }
+            Err(error) => {
+                cache.last_error = Some(error.to_string());
+                if let Some(models) = cache.models.as_ref().filter(|_| !force_refresh) {
+                    log::warn!(
+                        "[CopilotAuth] 账号 {account_id} 模型目录刷新失败，保留旧缓存: {error}"
+                    );
+                    Ok(models.clone())
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn fetch_models_for_account_uncached(
@@ -856,49 +983,17 @@ impl CopilotAuthManager {
             .await
             .map_err(|e| CopilotAuthError::ParseError(e.to_string()))?;
 
-        let models: Vec<CopilotModel> = models_response
-            .data
-            .into_iter()
-            .filter(|m| m.model_picker_enabled)
-            .map(|m| CopilotModel {
-                id: m.id,
-                name: m.name,
-                vendor: m.vendor,
-                model_picker_enabled: m.model_picker_enabled,
-            })
-            .collect();
+        let models = models_response.data;
 
         log::info!("[CopilotAuth] 获取到 {} 个可用模型", models.len());
 
         Ok(models)
     }
 
-    pub async fn get_model_vendor_for_account(
-        &self,
-        account_id: &str,
-        model_id: &str,
-    ) -> Result<Option<String>, CopilotAuthError> {
-        let models = self.fetch_models_for_account(account_id).await?;
-        Ok(models
-            .into_iter()
-            .find(|model| model.id == model_id)
-            .map(|model| model.vendor))
-    }
-
     /// 获取 Copilot 可用模型列表（向后兼容：使用第一个账号）
     pub async fn fetch_models(&self) -> Result<Vec<CopilotModel>, CopilotAuthError> {
         match self.resolve_default_account_id().await {
             Some(id) => self.fetch_models_for_account(&id).await,
-            None => Err(CopilotAuthError::GitHubTokenInvalid),
-        }
-    }
-
-    pub async fn get_model_vendor(
-        &self,
-        model_id: &str,
-    ) -> Result<Option<String>, CopilotAuthError> {
-        match self.resolve_default_account_id().await {
-            Some(id) => self.get_model_vendor_for_account(&id, model_id).await,
             None => Err(CopilotAuthError::GitHubTokenInvalid),
         }
     }
@@ -1697,7 +1792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_model_vendor_from_cache() {
+    async fn test_get_model_metadata_from_cache() {
         let temp_dir = tempdir().unwrap();
         let manager = CopilotAuthManager::new(temp_dir.path().to_path_buf());
 
@@ -1725,31 +1820,395 @@ mod tests {
             let mut models = manager.copilot_models.write().await;
             models.insert(
                 "12345".to_string(),
-                vec![
-                    CopilotModel {
-                        id: "gpt-5.4".to_string(),
-                        name: "GPT-5.4".to_string(),
-                        vendor: "OpenAI".to_string(),
-                        model_picker_enabled: true,
-                    },
-                    CopilotModel {
-                        id: "claude-sonnet-4".to_string(),
-                        name: "Claude Sonnet 4".to_string(),
-                        vendor: "Anthropic".to_string(),
-                        model_picker_enabled: true,
-                    },
-                ],
+                Arc::new(Mutex::new(CopilotModelsCache {
+                    models: Some(vec![
+                        catalog_model("gpt-5.4", "OpenAI", &[]),
+                        catalog_model("claude-sonnet-4", "Anthropic", &[]),
+                    ]),
+                    fetched_at: Some(Instant::now()),
+                    ..Default::default()
+                })),
             );
         }
 
-        let vendor = manager
-            .get_model_vendor_for_account("12345", "gpt-5.4")
+        let models = manager
+            .fetch_models_for_request(Some("12345"), "GPT-5.4")
             .await
             .unwrap();
-        assert_eq!(vendor.as_deref(), Some("OpenAI"));
+        assert_eq!(models[0].vendor, "OpenAI");
+        assert!(models[0].uses_responses_api());
 
-        let default_vendor = manager.get_model_vendor("claude-sonnet-4").await.unwrap();
-        assert_eq!(default_vendor.as_deref(), Some("Anthropic"));
+        let default_models = manager
+            .fetch_models_for_request(None, "claude-sonnet-4")
+            .await
+            .unwrap();
+        assert_eq!(default_models[1].vendor, "Anthropic");
+        assert!(!default_models[1].uses_responses_api());
+    }
+
+    fn catalog_model(id: &str, vendor: &str, endpoints: &[&str]) -> CopilotModel {
+        CopilotModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            vendor: vendor.to_string(),
+            model_picker_enabled: true,
+            supported_endpoints: endpoints
+                .iter()
+                .map(|endpoint| endpoint.to_string())
+                .collect(),
+        }
+    }
+
+    struct MockCatalog {
+        manager: CopilotAuthManager,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        response: Arc<RwLock<(axum::http::StatusCode, serde_json::Value)>>,
+        server: tokio::task::JoinHandle<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Drop for MockCatalog {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl MockCatalog {
+        async fn new(models: Vec<CopilotModel>) -> Self {
+            let directory = tempdir().unwrap();
+            let manager = CopilotAuthManager::new(directory.path().to_path_buf());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let response = Arc::new(RwLock::new((
+                axum::http::StatusCode::OK,
+                serde_json::json!({"data": models}),
+            )));
+            let app = axum::Router::new().route(
+                "/models",
+                axum::routing::get({
+                    let requests = requests.clone();
+                    let response = response.clone();
+                    move || {
+                        let requests = requests.clone();
+                        let response = response.clone();
+                        async move {
+                            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let (status, body) = response.read().await.clone();
+                            (status, axum::Json(body))
+                        }
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            *manager.default_account_id.write().await = Some("12345".to_string());
+            for (id, login) in [(12345, "alice"), (67890, "bob")] {
+                let account_id = id.to_string();
+                manager.accounts.write().await.insert(
+                    account_id.clone(),
+                    GitHubAccountData {
+                        github_token: "gho_test".to_string(),
+                        user: GitHubUser {
+                            login: login.to_string(),
+                            id,
+                            avatar_url: None,
+                        },
+                        authenticated_at: 1700000000,
+                        github_domain: DEFAULT_GITHUB_DOMAIN.to_string(),
+                    },
+                );
+                manager.copilot_tokens.write().await.insert(
+                    account_id.clone(),
+                    CopilotToken {
+                        token: "test".to_string(),
+                        expires_at: chrono::Utc::now().timestamp() + 3600,
+                    },
+                );
+                manager
+                    .api_endpoints
+                    .write()
+                    .await
+                    .insert(account_id, format!("http://{address}"));
+            }
+            Self {
+                manager,
+                requests,
+                response,
+                server,
+                _directory: directory,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn seed(&self, account: &str, models: Vec<CopilotModel>, age: Duration) {
+            let fetched_at = Instant::now() - age;
+            self.manager.copilot_models.write().await.insert(
+                account.to_string(),
+                Arc::new(Mutex::new(CopilotModelsCache {
+                    models: Some(models),
+                    fetched_at: Some(fetched_at),
+                    last_attempt: Some(fetched_at),
+                    last_error: None,
+                })),
+            );
+        }
+
+        async fn end_cooldown(&self, account: &str) {
+            let entry = self.manager.copilot_models.read().await[account].clone();
+            entry.lock().await.last_attempt = Some(Instant::now() - MODELS_REFRESH_COOLDOWN);
+        }
+    }
+
+    #[test]
+    fn test_model_declared_endpoints_override_vendor() {
+        assert!(catalog_model("new-model", "Other", &["/responses"]).uses_responses_api());
+        assert!(catalog_model("new-model", "Other", &["/v1/responses"]).uses_responses_api());
+        assert!(!catalog_model("gpt-old", "OpenAI", &["/chat/completions"]).uses_responses_api());
+        assert!(!catalog_model("ws-only", "OpenAI", &["ws:/responses"]).uses_responses_api());
+        assert!(catalog_model("legacy", "openai", &[]).uses_responses_api());
+        assert!(!catalog_model("legacy", "Anthropic", &[]).uses_responses_api());
+    }
+
+    #[test]
+    fn test_models_response_accepts_legacy_and_new_metadata() {
+        let response: CopilotModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": "legacy", "name": "Legacy", "vendor": "OpenAI", "model_picker_enabled": true},
+                {"id": "new", "name": "New", "vendor": "OpenAI", "model_picker_enabled": false,
+                 "supported_endpoints": ["/responses", "ws:/responses"]}
+            ]
+        }))
+        .unwrap();
+        assert!(response.data[0].supported_endpoints.is_empty());
+        assert_eq!(
+            response.data[1].supported_endpoints,
+            ["/responses", "ws:/responses"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_models_cache_expires_after_one_day() {
+        let new = catalog_model("gpt-new", "OpenAI", &["/responses"]);
+        let mock = MockCatalog::new(vec![new]).await;
+        mock.seed(
+            "12345",
+            vec![catalog_model("gpt-old", "OpenAI", &[])],
+            MODELS_CACHE_TTL,
+        )
+        .await;
+
+        let models = mock.manager.fetch_models().await.unwrap();
+        assert_eq!(models[0].id, "gpt-new");
+        mock.manager.fetch_models().await.unwrap();
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_new_model_refreshes_unexpired_catalog_before_routing() {
+        let mock = MockCatalog::new(vec![catalog_model(
+            "gpt-6-astra",
+            "OpenAI",
+            &["/responses", "ws:/responses"],
+        )])
+        .await;
+        mock.seed(
+            "12345",
+            vec![catalog_model("gpt-old", "OpenAI", &[])],
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        let models = mock
+            .manager
+            .fetch_models_for_request(None, "gpt-6-astra")
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "gpt-6-astra");
+        assert!(models[0].uses_responses_api());
+        mock.manager
+            .fetch_models_for_request(None, "GPT-6-ASTRA")
+            .await
+            .unwrap();
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_models_share_refresh_cooldown() {
+        let mock = MockCatalog::new(vec![catalog_model("gpt-known", "OpenAI", &[])]).await;
+        mock.seed("12345", vec![], Duration::from_secs(3600)).await;
+        for id in ["unknown-a", "unknown-a", "unknown-b"] {
+            mock.manager
+                .fetch_models_for_request(None, id)
+                .await
+                .unwrap();
+        }
+        mock.manager.refresh_models_for_request(None).await.unwrap();
+        assert_eq!(mock.request_count(), 1);
+
+        mock.end_cooldown("12345").await;
+        mock.manager
+            .fetch_models_for_request(None, "unknown-a")
+            .await
+            .unwrap();
+        assert_eq!(mock.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_model_fetches_are_coalesced() {
+        let mock = MockCatalog::new(vec![catalog_model("gpt-new", "OpenAI", &[])]).await;
+        let results = futures::future::join_all(
+            (0..12).map(|_| mock.manager.fetch_models_for_request(None, "gpt-new")),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(mock.request_count(), 1);
+
+        mock.end_cooldown("12345").await;
+        let results = futures::future::join_all(
+            (0..12).map(|_| mock.manager.refresh_models_for_request(None)),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(mock.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_error_refreshes_known_model_metadata() {
+        let mock =
+            MockCatalog::new(vec![catalog_model("gpt-new", "OpenAI", &["/responses"])]).await;
+        mock.seed(
+            "12345",
+            vec![catalog_model("gpt-new", "OpenAI", &["/chat/completions"])],
+            Duration::from_secs(3600),
+        )
+        .await;
+        let before = mock
+            .manager
+            .fetch_models_for_request(None, "gpt-new")
+            .await
+            .unwrap();
+        assert!(!before[0].uses_responses_api());
+        assert_eq!(mock.request_count(), 0);
+
+        mock.manager.refresh_models_for_request(None).await.unwrap();
+        let after = mock
+            .manager
+            .fetch_models_for_request(None, "gpt-new")
+            .await
+            .unwrap();
+        assert!(after[0].uses_responses_api());
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_refresh_preserves_stale_catalog_and_backs_off() {
+        let mock = MockCatalog::new(vec![]).await;
+        mock.seed(
+            "12345",
+            vec![catalog_model("gpt-old", "OpenAI", &["/responses"])],
+            MODELS_CACHE_TTL,
+        )
+        .await;
+        let entry = mock.manager.copilot_models.read().await["12345"].clone();
+        let original_fetched_at = entry.lock().await.fetched_at;
+        *mock.response.write().await = (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "unavailable"}),
+        );
+        for _ in 0..3 {
+            let models = mock
+                .manager
+                .fetch_models_for_request(None, "gpt-old")
+                .await
+                .unwrap();
+            assert_eq!(models[0].id, "gpt-old");
+            assert!(models[0].uses_responses_api());
+        }
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(entry.lock().await.fetched_at, original_fetched_at);
+        assert!(mock.manager.refresh_models_for_request(None).await.is_err());
+        assert_eq!(mock.request_count(), 1);
+
+        mock.end_cooldown("12345").await;
+        *mock.response.write().await = (
+            axum::http::StatusCode::OK,
+            serde_json::json!({"data": [catalog_model("gpt-new", "OpenAI", &[])]}),
+        );
+        let models = mock.manager.fetch_models().await.unwrap();
+        assert_eq!(models[0].id, "gpt-new");
+        assert_eq!(mock.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cold_catalog_failure_is_rate_limited() {
+        let mock = MockCatalog::new(vec![]).await;
+        *mock.response.write().await = (
+            axum::http::StatusCode::OK,
+            serde_json::json!({"malformed": "missing data"}),
+        );
+        for _ in 0..3 {
+            assert!(mock.manager.fetch_models().await.is_err());
+        }
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_model_cache_and_refresh_are_account_scoped() {
+        let mock = MockCatalog::new(vec![catalog_model("alice-new", "OpenAI", &[])]).await;
+        mock.seed(
+            "67890",
+            vec![catalog_model("bob-model", "Anthropic", &[])],
+            Duration::from_secs(3600),
+        )
+        .await;
+        mock.manager
+            .refresh_models_for_request(Some("12345"))
+            .await
+            .unwrap();
+        let bob = mock
+            .manager
+            .fetch_models_for_request(Some("67890"), "bob-model")
+            .await
+            .unwrap();
+        assert_eq!(bob[0].id, "bob-model");
+        assert_eq!(mock.request_count(), 1);
+        mock.manager.remove_account("67890").await.unwrap();
+        assert!(mock
+            .manager
+            .fetch_models_for_account("67890")
+            .await
+            .is_err());
+        assert!(!mock
+            .manager
+            .copilot_models
+            .read()
+            .await
+            .contains_key("67890"));
+    }
+
+    #[tokio::test]
+    async fn test_hidden_model_metadata_is_available_without_changing_picker() {
+        let visible = catalog_model("gpt-visible", "OpenAI", &[]);
+        let mut hidden = catalog_model("gpt-hidden", "OpenAI", &["/responses"]);
+        hidden.model_picker_enabled = false;
+        let mock = MockCatalog::new(vec![visible, hidden]).await;
+        let picker = mock.manager.fetch_models().await.unwrap();
+        assert_eq!(picker.len(), 1);
+        assert_eq!(picker[0].id, "gpt-visible");
+        let models = mock
+            .manager
+            .fetch_models_for_request(None, "gpt-hidden")
+            .await
+            .unwrap();
+        assert!(models
+            .iter()
+            .any(|model| model.id == "gpt-hidden" && model.uses_responses_api()));
+        assert_eq!(mock.request_count(), 1);
     }
 
     #[tokio::test]

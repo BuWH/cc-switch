@@ -183,7 +183,8 @@ fn family_fallback(target: &str, models: &[CopilotModel], excluded: &[String]) -
             .iter()
             .filter(|m| {
                 let lower = m.id.to_ascii_lowercase();
-                lower.contains(family)
+                m.model_picker_enabled
+                    && lower.contains(family)
                     && lower.ends_with("-1m") == require_1m
                     && !is_excluded(&m.id, excluded)
             })
@@ -323,6 +324,7 @@ mod tests {
             name: id.to_string(),
             vendor: "anthropic".to_string(),
             model_picker_enabled: true,
+            supported_endpoints: Vec::new(),
         }
     }
 
@@ -393,6 +395,18 @@ mod tests {
     fn resolve_handles_non_claude_target() {
         let models = vec![model("claude-sonnet-4.6")];
         assert_eq!(resolve_against_models("gpt-5", &models), None);
+    }
+
+    #[test]
+    fn resolve_hidden_models_only_by_exact_match() {
+        let mut hidden = model("claude-opus-5");
+        hidden.model_picker_enabled = false;
+        let models = vec![model("claude-opus-4.6"), hidden];
+        assert_eq!(resolve_against_models("claude-opus-5", &models), None);
+        assert_eq!(
+            resolve_against_models("claude-opus-6", &models),
+            Some("claude-opus-4.6".to_string())
+        );
     }
 
     #[test]

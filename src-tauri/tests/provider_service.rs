@@ -652,9 +652,17 @@ wire_api = "responses"
         config_after_takeover.contains(&codex_proxy_base_url),
         "enabling takeover should point Codex config.toml at the local proxy"
     );
+    let takeover_config: toml::Value =
+        toml::from_str(&config_after_takeover).expect("parse taken-over config");
+    assert_eq!(
+        takeover_config["model_providers"]["deepseek"]["requires_openai_auth"].as_bool(),
+        Some(true),
+        "takeover with preserved OAuth should use native ChatGPT authentication"
+    );
     assert!(
-        config_after_takeover.contains("PROXY_MANAGED"),
-        "enabling takeover should move the proxy placeholder into config.toml"
+        !config_after_takeover.contains("PROXY_MANAGED")
+            && !config_after_takeover.contains("experimental_bearer_token"),
+        "native-auth takeover must not override preserved OAuth with a proxy bearer token"
     );
     assert!(
         !config_after_takeover.contains("https://api.deepseek.com/v1"),
@@ -2250,9 +2258,16 @@ wire_api = "responses"
         live_config.contains("http://127.0.0.1:15721/v1"),
         "live config should remain pointed at the local proxy"
     );
+    let parsed_live: toml::Value = toml::from_str(&live_config).expect("parse live config");
+    assert_eq!(
+        parsed_live["model_providers"]["deepseek-new"]["requires_openai_auth"].as_bool(),
+        Some(true),
+        "switching a taken-over provider with preserved OAuth should keep native authentication"
+    );
     assert!(
-        live_config.contains("PROXY_MANAGED"),
-        "live config should keep the proxy bearer placeholder"
+        !live_config.contains("PROXY_MANAGED")
+            && !live_config.contains("experimental_bearer_token"),
+        "the legacy proxy bearer placeholder should be removed from the native-auth route"
     );
     assert!(
         live_config.contains(r#"model_provider = "deepseek-new""#)

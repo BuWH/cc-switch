@@ -8,18 +8,21 @@ use super::{
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
+    providers::copilot_responses_stream::normalize_copilot_responses_stream,
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
     ProxyError,
 };
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::{app_config::AppType, provider::Provider};
 use axum::http::{header::HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -147,6 +150,18 @@ pub fn is_sse_response(response: &ProxyResponse) -> bool {
     response.is_sse()
 }
 
+fn needs_copilot_response_ids(
+    app_type: &AppType,
+    provider: &Provider,
+    response: &ProxyResponse,
+) -> bool {
+    matches!(app_type, AppType::Codex | AppType::GrokBuild)
+        && provider.is_github_copilot()
+        && response.status().is_success()
+        && response.is_sse()
+        && get_content_encoding(response.headers()).is_none()
+}
+
 /// 处理流式响应
 pub async fn handle_streaming(
     response: ProxyResponse,
@@ -173,6 +188,10 @@ pub async fn handle_streaming(
 
     let mut response_headers = response.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
+    let normalize_ids = needs_copilot_response_ids(&ctx.app_type, &ctx.provider, &response);
+    if normalize_ids {
+        strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    }
 
     let mut builder = axum::response::Response::builder().status(status);
 
@@ -183,6 +202,12 @@ pub async fn handle_streaming(
 
     // 创建字节流
     let stream = response.bytes_stream();
+    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = if normalize_ids
+    {
+        Box::pin(normalize_copilot_responses_stream(stream))
+    } else {
+        Box::pin(stream)
+    };
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
@@ -869,6 +894,73 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn copilot_identity_fix_only_applies_to_successful_native_responses_streams() {
+        let mut provider = Provider::with_id(
+            "copilot".to_string(),
+            "Copilot".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            ..Default::default()
+        });
+        let response = |status, content_type: &str, encoding: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", content_type.parse().unwrap());
+            if let Some(encoding) = encoding {
+                headers.insert("content-encoding", encoding.parse().unwrap());
+            }
+            ProxyResponse::buffered(status, headers, Bytes::new())
+        };
+        let sse = response(http::StatusCode::OK, "text/event-stream", None);
+        assert!(needs_copilot_response_ids(&AppType::Codex, &provider, &sse));
+        assert!(needs_copilot_response_ids(
+            &AppType::GrokBuild,
+            &provider,
+            &sse
+        ));
+        assert!(!needs_copilot_response_ids(
+            &AppType::Claude,
+            &provider,
+            &sse
+        ));
+        assert!(!needs_copilot_response_ids(
+            &AppType::Gemini,
+            &provider,
+            &sse
+        ));
+        assert!(!needs_copilot_response_ids(
+            &AppType::Codex,
+            &provider,
+            &response(http::StatusCode::BAD_REQUEST, "text/event-stream", None)
+        ));
+        assert!(!needs_copilot_response_ids(
+            &AppType::Codex,
+            &provider,
+            &response(http::StatusCode::OK, "application/json", None)
+        ));
+        assert!(!needs_copilot_response_ids(
+            &AppType::Codex,
+            &provider,
+            &response(http::StatusCode::OK, "text/event-stream", Some("gzip"))
+        ));
+        assert!(needs_copilot_response_ids(
+            &AppType::Codex,
+            &provider,
+            &response(http::StatusCode::OK, "text/event-stream", Some("identity"))
+        ));
+        for provider_type in [None, Some("codex_oauth"), Some("xai_oauth")] {
+            provider.meta.as_mut().unwrap().provider_type = provider_type.map(str::to_owned);
+            assert!(!needs_copilot_response_ids(
+                &AppType::Codex,
+                &provider,
+                &sse
+            ));
+        }
+    }
 
     #[test]
     fn format_headers_keeps_only_allowlisted_diagnostic_values() {

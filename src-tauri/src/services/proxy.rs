@@ -7495,7 +7495,11 @@ wire_api = "chat"
     }
 
     #[test]
+    #[serial]
     fn codex_takeover_without_chatgpt_login_keeps_provider_placeholder_mode() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let service = ProxyService::new(Arc::new(Database::memory().expect("init db")));
         let mut provider = Provider::with_id(
             "custom".to_string(),
             "Custom".to_string(),
@@ -7527,11 +7531,23 @@ requires_openai_auth = true
             settings["auth"]["OPENAI_API_KEY"].as_str(),
             Some(PROXY_TOKEN_PLACEHOLDER)
         );
-        let config = settings["config"].as_str().expect("projected config");
+        service
+            .write_codex_takeover_live_for_provider(
+                &settings,
+                Some(&provider),
+                use_native_chatgpt_auth,
+            )
+            .expect("write takeover");
+        let config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read live config");
         assert!(
-            !crate::codex_config::codex_config_active_provider_requires_openai_auth(config),
+            !crate::codex_config::codex_config_active_provider_requires_openai_auth(&config),
             "provider placeholder mode must not ask Codex for ChatGPT auth"
         );
+        assert!(config.contains(&format!(
+            "experimental_bearer_token = \"{PROXY_TOKEN_PLACEHOLDER}\""
+        )));
+        assert!(!crate::codex_config::get_codex_auth_path().exists());
     }
 
     #[test]

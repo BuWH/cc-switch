@@ -119,6 +119,10 @@ opt-level = "s"
 panic = "unwind"
 strip = "symbols"
 
+[profile.release.build-override]
+# 编译期宏需要保留可加载符号；最终应用仍沿用 release 的 symbols 裁剪。
+strip = "none"
+
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"

@@ -978,7 +978,7 @@ impl RequestForwarder {
                 .is_some_and(|error| is_copilot_model_not_supported_error(provider, error))
             {
                 if let Some(rejected_model) = self
-                    .resolve_copilot_outbound_model(provider, &provider_body)
+                    .resolve_copilot_outbound_model(app_type, endpoint, provider, &provider_body)
                     .await
                 {
                     temporarily_reject_copilot_model(&provider.id, &rejected_model);
@@ -3256,10 +3256,30 @@ impl RequestForwarder {
 
     async fn resolve_copilot_outbound_model(
         &self,
+        app_type: &AppType,
+        endpoint: &str,
         provider: &Provider,
         body: &Value,
     ) -> Option<String> {
-        let (mapped_body, _, _) = super::model_mapper::apply_model_mapping(body.clone(), provider);
+        let mapped_body = if self.keeps_resolved_model() {
+            body.clone()
+        } else {
+            super::model_mapper::apply_model_mapping(body.clone(), provider).0
+        };
+        if matches!(app_type, AppType::Codex)
+            && super::providers::is_codex_responses_endpoint(endpoint)
+        {
+            return self
+                .resolve_codex_copilot_model(
+                    provider,
+                    &mapped_body,
+                    CodexCopilotApiFormat::from_meta(provider.meta.as_ref()),
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|model| model.id);
+        }
         let normalized =
             super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
         let model_id = normalized.get("model")?.as_str()?.to_string();

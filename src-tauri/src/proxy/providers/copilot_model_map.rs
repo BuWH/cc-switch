@@ -824,6 +824,30 @@ mod tests {
     }
 
     #[test]
+    fn rejected_model_fallback_keeps_the_replacement_transport() {
+        let newest = model_with_endpoints("claude-opus-5", &["/responses"]);
+        let older = model_with_endpoints("claude-opus-4.8", &["/chat/completions"]);
+        let models = [newest, older];
+        let excluded = vec!["CLAUDE-OPUS-5".to_string()];
+        let resolved = resolve_model_with_format_excluding(
+            "claude-opus-5",
+            &models,
+            CodexCopilotApiFormat::Auto,
+            &excluded,
+        )
+        .unwrap();
+        assert_eq!(resolved.id, "claude-opus-4.8");
+        assert_eq!(resolved.transport.unwrap().protocol, CopilotProtocol::Chat);
+        assert!(resolve_model_with_format_excluding(
+            "claude-opus-5",
+            &models,
+            CodexCopilotApiFormat::OpenaiResponses,
+            &excluded,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn shared_model_match_preserves_rewrite_and_catalog_id_semantics() {
         let models = vec![
             model("claude-sonnet-4.5"),

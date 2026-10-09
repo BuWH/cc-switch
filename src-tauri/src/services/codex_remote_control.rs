@@ -232,6 +232,10 @@ fn active_proxy_uses_chatgpt_auth() -> bool {
 
 #[cfg(not(test))]
 pub async fn ensure_for_active_proxy() -> Result<Option<CodexRemoteDaemonAction>, String> {
+    // 集成测试的库不是 cfg(test)，不能让临时 HOME 触发真实用户的 daemon。
+    if std::env::var_os("CC_SWITCH_TEST_HOME").is_some() {
+        return Ok(None);
+    }
     if !active_proxy_uses_chatgpt_auth() {
         return Ok(None);
     }

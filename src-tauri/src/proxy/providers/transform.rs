@@ -602,14 +602,13 @@ fn clean_schema_inner(mut schema: Value, is_root: bool) -> Value {
 /// 最终 cache_read/cache_creation：直传字段优先于 OpenAI nested details。
 fn build_anthropic_usage_json(body: &Value) -> Value {
     let usage = body.get("usage").cloned().unwrap_or(json!({}));
-    let cached = usage
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(|v| v.as_u64())
-        })
+    // 显式 0 按未上报处理，继续查找低顺位字段及 DeepSeek 的命中字段。
+    fn provided_nonzero(value: Option<&Value>) -> Option<u64> {
+        value.and_then(Value::as_u64).filter(|tokens| *tokens > 0)
+    }
+    let cached = provided_nonzero(usage.get("cache_read_input_tokens"))
+        .or_else(|| provided_nonzero(usage.pointer("/prompt_tokens_details/cached_tokens")))
+        .or_else(|| provided_nonzero(usage.get("prompt_cache_hit_tokens")))
         .unwrap_or(0);
     let cache_creation = usage
         .get("cache_creation_input_tokens")
@@ -1564,6 +1563,28 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_to_anthropic_empty_choices_preserves_cache_fallbacks() {
+        for (direct, nested, expected) in [(0, 0, 60), (0, 70, 70), (80, 70, 80)] {
+            let result = openai_to_anthropic(json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 0,
+                    "cache_read_input_tokens": direct,
+                    "prompt_tokens_details": {"cached_tokens": nested},
+                    "prompt_cache_hit_tokens": 60,
+                    "cache_creation_input_tokens": 10
+                }
+            }))
+            .unwrap();
+            assert!(result["content"].as_array().unwrap().is_empty());
+            assert_eq!(result["usage"]["cache_read_input_tokens"], expected);
+            assert_eq!(result["usage"]["cache_creation_input_tokens"], 10);
+            assert_eq!(result["usage"]["input_tokens"], 90 - expected);
+        }
+    }
+
+    #[test]
     fn test_openai_to_anthropic_missing_choices_still_errors() {
         // choices 字段缺失 → 仍然报错
         let input = json!({
@@ -1896,6 +1917,32 @@ mod tests {
         assert_eq!(result["usage"]["input_tokens"], 0);
         assert_eq!(result["usage"]["cache_read_input_tokens"], 60);
         assert_eq!(result["usage"]["cache_creation_input_tokens"], 50);
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_stub_zero_cache_read_falls_through_to_deepseek_hit_tokens() {
+        // #8041 报告者 payload：显式 0 的 cache_read_input_tokens 按「未上报」处理
+        // 继续向后找（与 usage/parser.rs、流式 extract_cache_read_tokens 同规则），
+        // 真值在末位兜底 prompt_cache_hit_tokens；fresh input = 6650 - 6400 = 250。
+        let input = json!({
+            "id": "chatcmpl-stub0",
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 6650,
+                "completion_tokens": 16,
+                "cache_read_input_tokens": 0,
+                "prompt_cache_hit_tokens": 6400
+            }
+        });
+
+        let result = openai_to_anthropic(input).unwrap();
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 6400);
+        assert_eq!(result["usage"]["input_tokens"], 250);
     }
 
     #[test]

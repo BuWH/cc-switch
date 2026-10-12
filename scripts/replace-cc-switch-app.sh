@@ -5,6 +5,7 @@ set -euo pipefail
 DEFAULT_APP_PATH="/Applications/CC Switch.app"
 DEFAULT_PORT="15721"
 DEFAULT_DELAY="30"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,10 @@ tell the user that the provider will briefly restart. The launchd worker will:
   2. atomically swap the pre-staged app into /Applications;
   3. start the new app and wait for /health;
   4. roll back and restart the old app if validation fails.
+
+The signed app must contain CCSwitchSourceCommit in Info.plist. Its source
+commit must equal clean local main and origin/main (including the live server).
+Old artifacts without provenance are rejected; rebuild instead of bypassing.
 
 Per-run status and logs are written under:
   /private/tmp/cc-switch-replace-<run-id>/
@@ -52,6 +57,11 @@ validate_app() {
   local expected_version="$2"
   local host_arch="$3"
   local actual_version
+  local lipo_tool="lipo"
+
+  if [[ -x "/Library/Developer/CommandLineTools/usr/bin/lipo" ]]; then
+    lipo_tool="/Library/Developer/CommandLineTools/usr/bin/lipo"
+  fi
 
   [[ -d "$app_path" ]] || {
     print -u2 "App bundle not found: $app_path"
@@ -67,7 +77,13 @@ validate_app() {
     return 1
   fi
 
-  lipo -archs "$app_path/Contents/MacOS/cc-switch" | tr " " "\n" |
+  if [[ -n "${SOURCE_COMMIT:-}" ]] &&
+    [[ "$(plutil -extract CCSwitchSourceCommit raw "$app_path/Contents/Info.plist" 2>/dev/null)" != "$SOURCE_COMMIT" ]]; then
+    print -u2 "App source commit does not match the validated main commit"
+    return 1
+  fi
+
+  "$lipo_tool" -archs "$app_path/Contents/MacOS/cc-switch" | tr " " "\n" |
     grep -Fxq "$host_arch" || {
     print -u2 "Architecture $host_arch not found in app binary"
     return 1
@@ -85,6 +101,7 @@ write_status() {
     printf "run_id=%s\n" "$RUN_ID"
     printf "state=%s\n" "$state"
     printf "expected_version=%s\n" "$EXPECTED_VERSION"
+    printf "source_commit=%s\n" "$SOURCE_COMMIT"
     printf "app_path=%s\n" "$APP_PATH"
     printf "port=%s\n" "$PORT"
     printf "updated_at=%s\n" "$(timestamp)"
@@ -207,6 +224,7 @@ worker_main() {
   STATUS_PATH="$7"
   LOG_PATH="$8"
   JOB_LABEL="$9"
+  SOURCE_COMMIT="${10}"
   BACKUP_PATH="${APP_PATH}.backup-${RUN_ID}"
   HOST_ARCH="$(uname -m)"
 
@@ -216,6 +234,7 @@ worker_main() {
 
   if [[ ! -d "$CANDIDATE_PATH" ]]; then
     if [[ "$(app_version "$APP_PATH" 2>/dev/null || true)" == "$EXPECTED_VERSION" ]] &&
+      [[ "$(plutil -extract CCSwitchSourceCommit raw "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)" == "$SOURCE_COMMIT" ]] &&
       health_is_ready; then
       write_status "success" \
         "CC Switch ${EXPECTED_VERSION} already installed; provider healthy"
@@ -230,6 +249,10 @@ worker_main() {
   write_status "waiting" "launchd worker started; waiting before provider restart"
   sleep "$DELAY"
 
+  if ! /bin/zsh "$REPO_ROOT/scripts/check-release-source.sh" "$REPO_ROOT" "$SOURCE_COMMIT"; then
+    write_status "failed" "source commit is no longer current main; provider left running"
+    return 1
+  fi
   write_status "stopping" "stopping current CC Switch"
   if ! validate_app "$CANDIDATE_PATH" "$EXPECTED_VERSION" "$HOST_ARCH"; then
     write_status "failed" "pre-staged app validation failed"
@@ -282,7 +305,7 @@ worker_main() {
 
 if [[ "${1:-}" == "--worker" ]]; then
   shift
-  [[ "$#" -eq 9 ]] || {
+  [[ "$#" -eq 10 ]] || {
     print -u2 "Invalid worker invocation"
     exit 64
   }
@@ -408,6 +431,13 @@ elif [[ "$DMG_VERSION" != "$EXPECTED_VERSION" ]]; then
   exit 65
 fi
 
+SOURCE_COMMIT="$(plutil -extract CCSwitchSourceCommit raw \
+  "$SOURCE_APP/Contents/Info.plist" 2>/dev/null)" || {
+  print -u2 "App is missing CCSwitchSourceCommit; rebuild from committed main"
+  exit 65
+}
+/bin/zsh "$REPO_ROOT/scripts/check-release-source.sh" "$REPO_ROOT" "$SOURCE_COMMIT"
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   CANDIDATE_PATH="${RUN_DIR}/CC Switch.app"
 else
@@ -437,7 +467,7 @@ LABEL="com.ccswitch.replace.${RUN_ID}"
 if ! launchctl submit -l "$LABEL" -- \
   /bin/zsh "$SCRIPT_PATH" --worker \
   "$RUN_ID" "$EXPECTED_VERSION" "$DELAY" "$CANDIDATE_PATH" \
-  "$APP_PATH" "$PORT" "$STATUS_PATH" "$LOG_PATH" "$LABEL"; then
+  "$APP_PATH" "$PORT" "$STATUS_PATH" "$LOG_PATH" "$LABEL" "$SOURCE_COMMIT"; then
   rm -rf "$CANDIDATE_PATH"
   write_status "failed" "unable to submit launchd replacement worker"
   print -u2 "Unable to submit launchd replacement worker"
@@ -447,6 +477,7 @@ fi
 print -r -- "SCHEDULED"
 print -r -- "run_id=${RUN_ID}"
 print -r -- "version=${EXPECTED_VERSION}"
+print -r -- "source_commit=${SOURCE_COMMIT}"
 print -r -- "delay=${DELAY}"
 print -r -- "status=${STATUS_PATH}"
 print -r -- "log=${LOG_PATH}"

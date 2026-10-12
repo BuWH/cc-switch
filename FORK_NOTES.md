@@ -1,11 +1,48 @@
 # BuWH/cc-switch — Fork 维护笔记
 
-本 fork 在上游 `farion1231/cc-switch` 基础上叠加少量 patch,采用**轻量 fork + rebase**策略:
-不删任何功能,只加需要的 commit,定期 rebase 到上游最新,自己本地 build 使用,不等上游 merge。
+本 fork 在上游 `farion1231/cc-switch` 基础上保留兼容修复。`main` 是唯一长期集成
+和安装基线；功能分支只用于隔离开发，不能作为已完成修复的永久存放位置。
 
-## 本 fork 的 patch(相对上游 main)
+## 修复交付与安装门禁
 
-分支 `feat/codex-copilot-provider`,三个 commit:
+1. 每次从最新 `main` 创建独立分支/工作树。修复完成后必须提交、跑回归测试，
+   再安全合入本地 `main` 并普通推送 `origin/main`；未合入前不能宣称修复已交付。
+2. 发布前逐个检查 `git worktree list --porcelain` 中实际存在工作树的
+   `git status --short`、已暂存和未暂存 diff、以及 `main..branch` 提交。
+   仅看 branch HEAD 会漏掉未提交的修复。已完成且应保留的修复必须先迁入集成候选；
+   未完成或无关 WIP 明确列为暂不发布，保留原现场，不能盲目合并或清理。
+3. 必须覆盖真实请求处理路径的回归测试。Copilot 重复消息测试需要同时覆盖普通透传、
+   迟到工具参数修复、原生压缩路径，不能只测试 ID 稳定化函数本身。
+4. 从干净、已提交的源码构建，记录完整源码 SHA。允许先在隔离候选提交上测试和构建，
+   但安装前该精确提交必须成为本地和服务器 `main`，任何期间移动都要停下核对。
+5. 最终 staging 应用的 `Info.plist` 必须在签名前包含 `CCSwitchSourceCommit`，
+   值为本次实际构建的完整源码 SHA。封装后重新验证签名、DMG、版本、架构与 SHA-256。
+   不得给旧包补写新提交号来通过检查；同版本重新修复也必须重建并使用不同产物目录。
+6. 安装只能从主工作树调用最新 `scripts/replace-cc-switch-app.sh`，不再调用旧
+   feature 工作树脚本。脚本在预检及后台停止 provider 前再次核对包内源码提交、
+   干净本地 `main`、`origin/main` 和服务器 `refs/heads/main`。缺少来源或旧提交一律拒绝。
+7. 安装仍须用户明确授权；后台任务输出 `SCHEDULED` 后立即结束当前交互。
+
+签名前记录来源（`source_commit` 必须在干净源码构建前记录，并在构建后复核未变化）：
+
+```bash
+test -z "$(git status --porcelain)"
+source_commit=$(git rev-parse HEAD)
+pnpm tauri build --bundles dmg
+test "$(git rev-parse HEAD)" = "$source_commit"
+test -z "$(git status --porcelain)"
+# 将本次新构建应用复制到 staging 后，再写入来源并重新签名、封装和校验。
+/usr/libexec/PlistBuddy -c "Add :CCSwitchSourceCommit string $source_commit" \
+  "$staged_app/Contents/Info.plist"
+codesign --force --deep --sign - "$staged_app"
+```
+
+门禁独立回归测试：`zsh scripts/test-release-source.sh`。
+自动升级只构建和推送，不得安装；须将上述检查作为发布/替换前置条件。
+
+## 早期 Patch 历史
+
+以下为历史实现记录，部分能力已被上游原生支持；不作为当前开发或发布基线。
 
 1. **`fix(proxy): treat empty choices as valid empty response on both transform paths`**
    - 修复 Claude Code auto 权限模式下 Bash/edit 被锁死的 bug。
@@ -27,15 +64,13 @@
    - Codex 表单接入现有 `CopilotAuthSection` + `useCopilotAuth`,gated on `providerType === github_copilot`。
    - 账号绑定 / submit guard / providerType 持久化本就 app-agnostic,扩展 `isCopilotProvider` 认 Codex 分支后自动生效。
 
-## Rebase 到上游
+## 同步上游
 
 ```bash
-git fetch upstream
-git checkout feat/codex-copilot-provider
-git rebase upstream/main
-# 冲突面小(仅 4 个文件),解决后:
-cd src-tauri && cargo test --lib codex transform && cd ..
-bun run typecheck
+git fetch origin main
+git fetch upstream main --tags
+# 在从最新 main 创建的独立候选分支中合并 upstream/main。
+# 逐项迁入应保留的修复，通过测试/构建/产物验证后才 fast-forward main 并推送。
 ```
 
 ## 本地并存(与正式版 cc-switch 隔离)
@@ -53,7 +88,7 @@ cd /path/to/ccsw && bun run tauri dev
 正式版是当前 Codex token provider，禁止采用“先退出、再执行复制/启动命令”的多步交互
 流程。旧版退出后 agent 可能断连，导致新版永远没有机会启动。
 
-统一使用 `scripts/replace-cc-switch-app.sh`：它先在线完成预检和 staging，再把停旧版、
+统一使用 main 中的 `scripts/replace-cc-switch-app.sh`：它先在线完成来源预检和 staging，再把停旧版、
 原子替换、启动、`/health` 验证及失败回滚交给独立的用户域 launchd job。命令返回
 `SCHEDULED` 后，当前 agent 必须立即结束回复，不再执行后续工具调用。
 

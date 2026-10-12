@@ -1,5 +1,9 @@
 # CC Switch Fork — Codex + GitHub Copilot 支持
 
+> 本文为早期实现历史，下面旧 feature 分支/rebase/build 命令不再作为发布流程。
+> 当前以 `FORK_NOTES.md` 的 main 集成、工作树未提交修复审计和源码来源安装门禁为准。
+> 完成的修复必须提交、验证、合入并推送 main，才能安装对应源码构建的包。
+
 > 本 fork：`BuWH/cc-switch`（上游 `farion1231/cc-switch`）
 > 工作目录：`~/code/cc-switch`，功能分支 `feat/codex-copilot-provider`
 > 完成日期：2026-07-10

@@ -172,6 +172,20 @@ fn needs_copilot_response_ids(
         && get_content_encoding(response.headers()).is_none()
 }
 
+/// Apply identity repairs before handler-specific event rewrites.
+pub(crate) fn native_response_stream(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    let normalize_ids = needs_copilot_response_ids(&ctx.app_type, &ctx.provider, &response);
+    let stream = response.bytes_stream();
+    if normalize_ids {
+        Box::pin(normalize_copilot_responses_stream(stream))
+    } else {
+        Box::pin(stream)
+    }
+}
+
 /// 处理流式响应
 pub async fn handle_streaming(
     response: ProxyResponse,
@@ -211,13 +225,7 @@ pub async fn handle_streaming(
     }
 
     // 创建字节流
-    let stream = response.bytes_stream();
-    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = if normalize_ids
-    {
-        Box::pin(normalize_copilot_responses_stream(stream))
-    } else {
-        Box::pin(stream)
-    };
+    let stream = native_response_stream(response, ctx);
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);

@@ -36,8 +36,8 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_usage_collector, process_response,
-        read_decoded_body, strip_entity_headers_for_rebuilt_body,
+        create_logged_passthrough_stream, create_usage_collector, native_response_stream,
+        process_response, read_decoded_body, strip_entity_headers_for_rebuilt_body,
         strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
@@ -1193,7 +1193,7 @@ async fn handle_codex_native_compaction_response(
     let builder = rewritten_sse_response_builder(status, response.headers());
 
     let compaction_stream = super::providers::codex_compaction::create_native_compaction_sse_stream(
-        response.bytes_stream(),
+        native_response_stream(response, ctx),
     );
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
     let logged_stream = create_logged_passthrough_stream(
@@ -1493,7 +1493,7 @@ async fn handle_codex_late_arguments_repair(
     let builder = rewritten_sse_response_builder(status, response.headers());
     let repair_stream =
         super::providers::responses_late_arguments::create_late_arguments_repair_stream(
-            response.bytes_stream(),
+            native_response_stream(response, ctx),
         );
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
     let logged_stream = create_logged_passthrough_stream(
@@ -3240,6 +3240,171 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn copilot_native_handlers_preserve_streamed_message_identity() {
+        use crate::{
+            app_config::AppType,
+            database::Database,
+            mode::stack::StackTarget,
+            provider::{Provider, ProviderMeta},
+            proxy::{
+                handler_config::CODEX_PARSER_CONFIG, handler_context::RequestContext,
+                hyper_client::ProxyResponse, server::ProxyState,
+            },
+        };
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+
+        let state = ProxyState::for_test(Arc::new(Database::memory().unwrap()));
+        state.config.write().await.enable_logging = false;
+        let mut provider = Provider::with_id("copilot".into(), "Copilot".into(), json!({}), None);
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".into()),
+            ..Default::default()
+        });
+        assert!(crate::proxy::providers::provider_needs_responses_late_arguments_repair(&provider));
+        let fixture = [
+            json!({"type":"response.created","response":{"id":"response-first","output":[]}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"message-first","type":"message","role":"assistant","content":[]}}),
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"message-delta","delta":"DIAG_OK"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"id":"message-done","type":"message","role":"assistant","content":[{"type":"output_text","text":"DIAG_OK"}]}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"id":"call-first","type":"function_call","call_id":"call-wire","name":"lookup","arguments":""}}),
+            json!({"type":"response.function_call_arguments.done","output_index":1,"item_id":"call-arguments-done","arguments":""}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"id":"call-done","type":"function_call","call_id":"call-wire","name":"lookup","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"call-delta","delta":"{\"key\":1}"}),
+            json!({"type":"response.completed","response":{"id":"response-last","status":"completed","output":[{"id":"message-last","type":"message","role":"assistant","content":[{"type":"output_text","text":"DIAG_OK"}]},{"id":"call-last","type":"function_call","call_id":"call-wire","name":"lookup","arguments":"{\"key\":1}"}]}}),
+        ];
+        let sse = fixture
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        for (app_type, app_type_str) in
+            [(AppType::Codex, "codex"), (AppType::GrokBuild, "grokbuild")]
+        {
+            let ctx = RequestContext::new(
+                &state,
+                &json!({"model":"gpt-6-astra"}),
+                &axum::http::HeaderMap::new(),
+                app_type.clone(),
+                "test",
+                app_type_str,
+                Some(StackTarget {
+                    provider: provider.clone(),
+                    upstream_model: "gpt-6-astra".into(),
+                    original_model: "gpt-6-astra".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            for path in ["passthrough", "late_arguments", "compaction"] {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert("content-type", "text/event-stream".parse().unwrap());
+                headers.insert("content-length", sse.len().to_string().parse().unwrap());
+                let upstream = ProxyResponse::buffered(
+                    axum::http::StatusCode::OK,
+                    headers,
+                    Bytes::from(sse.clone()),
+                );
+                let response = match path {
+                    "late_arguments" => {
+                        super::handle_codex_late_arguments_repair(
+                            upstream, &ctx, &state, true, None,
+                        )
+                        .await
+                    }
+                    "compaction" => {
+                        super::handle_codex_native_compaction_response(upstream, &ctx, &state, None)
+                            .await
+                    }
+                    _ => {
+                        super::process_response(
+                            upstream,
+                            &ctx,
+                            &state,
+                            &CODEX_PARSER_CONFIG,
+                            true,
+                            None,
+                        )
+                        .await
+                    }
+                }
+                .unwrap();
+                assert!(!response.headers().contains_key("content-length"), "{path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let events: Vec<Value> = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| crate::proxy::sse::strip_sse_field(line, "data"))
+                    .filter_map(|data| serde_json::from_str(data).ok())
+                    .collect();
+                let mut text = String::new();
+                let mut repaired_arguments = 0;
+                let mut compaction_id = None;
+                let mut completed = 0;
+                for event in events {
+                    if event["item"]["type"] == "compaction" {
+                        assert_eq!(path, "compaction");
+                        assert_eq!(event["output_index"], 2);
+                        compaction_id = Some(event["item"]["id"].clone());
+                        continue;
+                    }
+                    let expected_id = if event["output_index"] == 1 {
+                        "call-first"
+                    } else {
+                        "message-first"
+                    };
+                    for id in [event.pointer("/item/id"), event.get("item_id")]
+                        .into_iter()
+                        .flatten()
+                    {
+                        assert_eq!(id, expected_id, "{path}: {}", event["type"]);
+                    }
+                    if let Some(id) = event.pointer("/response/id") {
+                        assert_eq!(id, "response-first", "{path}");
+                    }
+                    if event["type"] == "response.completed" {
+                        completed += 1;
+                        assert_eq!(
+                            event["response"]["output"][0]["id"], "message-first",
+                            "{path}"
+                        );
+                        assert_eq!(event["response"]["output"][1]["id"], "call-first", "{path}");
+                        assert_eq!(
+                            event["response"]["output"][1]["call_id"], "call-wire",
+                            "{path}"
+                        );
+                        if path == "compaction" {
+                            assert_eq!(event["response"]["output"][2]["type"], "compaction");
+                            assert_eq!(
+                                Some(&event["response"]["output"][2]["id"]),
+                                compaction_id.as_ref()
+                            );
+                        }
+                    }
+                    if path == "late_arguments" && event["output_index"] == 1 {
+                        let arguments = match event["type"].as_str() {
+                            Some("response.function_call_arguments.done") => event.get("arguments"),
+                            Some("response.output_item.done") => event.pointer("/item/arguments"),
+                            _ => None,
+                        };
+                        if let Some(arguments) = arguments {
+                            assert_eq!(arguments, "{\"key\":1}");
+                            repaired_arguments += 1;
+                        }
+                    }
+                    if event["type"] == "response.output_text.delta" {
+                        text.push_str(event["delta"].as_str().unwrap());
+                    }
+                }
+                assert_eq!(text, "DIAG_OK", "{path}");
+                assert_eq!(completed, 1, "{path}");
+                if path == "late_arguments" {
+                    assert_eq!(repaired_arguments, 2);
+                }
+            }
+        }
+    }
 
     /// 补发了压缩条目的 SSE 比上游声明的长：留着上游的 Content-Length，客户端读到那个
     /// 长度就停，补上的 compaction 条目和 response.completed 都收不到。

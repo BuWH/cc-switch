@@ -56,6 +56,17 @@ codesign --force --deep --sign - "$staged_app"
 - `fix/replacement-clt-validation-20260915` 的 CLT 选择逻辑已在当前替换脚本中，
   无需再合并旧分支提交。旧工作树保留原现场；其中这些补丁已集成，不代表尚待发布。
 
+### Grok 历史条目兼容补充
+
+- 只处理工具声明不足以覆盖旧会话：Copilot Grok 对不带可用条目 ID 的
+  `custom_tool_call` / `tool_search_call` 及对应结果可返回无详情的 422。
+  原生 Responses 出站现在将这些历史转换为标准函数调用，保留 call_id 和内容。
+- 在名称展开前提升 `tool_search_output` / `additional_tools` 内的工具声明；
+  同名 namespace 的不同子工具都保留，回包还原表也读取这些历史声明。
+- 回归包含整段历史重放。可用 `CC_SWITCH_COPILOT_SMOKE_URL` 显式运行
+  `copilot_grok_live_history_replay`；可选 `CC_SWITCH_GROK_HISTORY_FIXTURE` 指定本地
+  JSON 请求。它会调用真实上游并产生用量，正常离线测试中默认忽略。
+
 以下为历史实现记录，部分能力已被上游原生支持；不作为当前开发或发布基线。
 
 1. **`fix(proxy): treat empty choices as valid empty response on both transform paths`**

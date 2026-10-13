@@ -3503,13 +3503,13 @@ mod tests {
         headers.insert("etag", "\"original\"".parse().unwrap());
         let upstream =
             ProxyResponse::buffered(axum::http::StatusCode::OK, headers, Bytes::from(fixture));
-        let restore_map = std::collections::HashMap::from([(
-            "functions__lookup".into(),
-            super::transform_codex_responses_namespace::NamespacedName {
-                namespace: "functions".into(),
-                name: "lookup".into(),
-            },
-        )]);
+        let restore_map = super::transform_codex_responses_namespace::namespace_restore_map(
+            &json!({"input":[{"type":"tool_search_output","tools":[
+                {"type":"namespace","name":"functions","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}
+                ]}
+            ]}]}),
+        );
         let response = super::handle_codex_xai_native_responses_rewrite(
             upstream,
             &ctx,

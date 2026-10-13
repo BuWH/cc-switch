@@ -36,7 +36,9 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Number, Value};
 
-use super::transform_codex_responses_namespace::{restore_sse_event_namespaces, NamespacedName};
+use super::transform_codex_responses_namespace::{
+    is_input_tool_carrier, restore_sse_event_namespaces, NamespacedName,
+};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
@@ -105,7 +107,7 @@ pub(crate) fn sanitize_xai_responses_request(body: &mut Value) -> bool {
 
     // 4. Lift the `additional_tools` input carrier (Responses Lite private
     //    shape) up to top-level `tools` so the supported ones survive.
-    changed |= promote_additional_tools(body);
+    changed |= promote_input_tools(body);
 
     // 5. Drop `content: null` on reasoning input items — xAI's untagged enum
     //    deserializer refuses a present-but-null content field.
@@ -169,14 +171,14 @@ fn is_additional_tools_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str).map(str::trim) == Some("additional_tools")
 }
 
-/// Promote any `additional_tools` carrier items from `input` into top-level
-/// `tools`, preserving top-level order and appending carrier tools in order,
-/// de-duplicated. The carrier items themselves are removed from `input`.
-fn promote_additional_tools(body: &mut Value) -> bool {
+/// Promote inline declarations before flattening. Tool-search results stay in
+/// history until converted to standard function outputs; only the declaration-
+/// only `additional_tools` carrier is removed.
+fn promote_input_tools(body: &mut Value) -> bool {
     // Clone `input` up front so the later mutable write-back to `body` doesn't
     // collide with the read borrow. Only pays the clone on the rare carrier path.
     let input_items: Vec<Value> = match body.get("input").and_then(Value::as_array) {
-        Some(arr) if arr.iter().any(is_additional_tools_item) => arr.clone(),
+        Some(arr) if arr.iter().any(is_input_tool_carrier) => arr.clone(),
         _ => return false,
     };
 
@@ -192,8 +194,9 @@ fn promote_additional_tools(body: &mut Value) -> bool {
 
     let mut filtered_input: Vec<Value> = Vec::with_capacity(input_items.len());
     let mut promoted = false;
+    let mut removed = false;
     for item in input_items {
-        if is_additional_tools_item(&item) {
+        if is_input_tool_carrier(&item) {
             if let Some(carrier_tools) = item.get("tools").and_then(Value::as_array) {
                 for tool in carrier_tools {
                     if seen.insert(tool_dedup_key(tool)) {
@@ -202,7 +205,10 @@ fn promote_additional_tools(body: &mut Value) -> bool {
                     }
                 }
             }
-            continue; // carrier item dropped regardless of dedup outcome
+            if is_additional_tools_item(&item) {
+                removed = true;
+                continue;
+            }
         }
         filtered_input.push(item);
     }
@@ -213,8 +219,7 @@ fn promote_additional_tools(body: &mut Value) -> bool {
             obj.insert("tools".to_string(), Value::Array(merged));
         }
     }
-    // We reached here only because a carrier existed, so `input` changed.
-    true
+    promoted || removed
 }
 
 /// Stable dedup key for a tool: `(type, name)`, `(mcp, server_label)`, or the
@@ -225,6 +230,11 @@ fn tool_dedup_key(tool: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    // Separate searches can load different children of the same namespace.
+    // Keep both groups so the flattener can deduplicate their individual tools.
+    if tool_type == "namespace" {
+        return tool.to_string();
+    }
     if !tool_type.is_empty() {
         if let Some(name) = tool.get("name").and_then(Value::as_str) {
             let name = name.trim();
@@ -647,7 +657,9 @@ pub(crate) fn prepare_xai_native_responses_request(
     ) {
         return Ok(());
     }
+    promote_input_tools(body);
     super::transform_codex_responses_namespace::flatten_request_namespaces(body)?;
+    rewrite_xai_private_tool_history(body);
 
     let is_copilot = provider.is_github_copilot();
     apply_xai_native_responses_request_compat(
@@ -671,6 +683,57 @@ pub(crate) fn prepare_xai_native_responses_request(
         }
     }
     Ok(())
+}
+
+/// Replay Codex-private tool history through xAI's standard function-call
+/// schema. Keep pairing and result content; these are historical calls, not
+/// new declarations of custom/tool-search tools that the gateway rejects.
+fn rewrite_xai_private_tool_history(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("custom_tool_call") => {
+                let input = item.remove("input").unwrap_or_else(|| json!(""));
+                item.insert("type".into(), json!("function_call"));
+                item.insert(
+                    "arguments".into(),
+                    json!(json!({"input": input}).to_string()),
+                );
+            }
+            Some("tool_search_call") => {
+                let arguments = item.remove("arguments").unwrap_or_else(|| json!({}));
+                let arguments = match arguments {
+                    Value::String(arguments) => arguments,
+                    other => other.to_string(),
+                };
+                item.insert("type".into(), json!("function_call"));
+                item.insert("name".into(), json!("tool_search"));
+                item.insert("arguments".into(), json!(arguments));
+                item.remove("execution");
+            }
+            Some("custom_tool_call_output") => {
+                item.insert("type".into(), json!("function_call_output"));
+                item.remove("status");
+            }
+            Some("tool_search_output") => {
+                let tools = item.remove("tools").unwrap_or_else(|| json!([]));
+                let mut output = json!({"tools": tools});
+                if let Some(value) = item.remove("output") {
+                    output["output"] = value;
+                }
+                item.insert("type".into(), json!("function_call_output"));
+                item.insert("output".into(), json!(output.to_string()));
+                item.remove("status");
+                item.remove("execution");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Apply xAI rewrites after namespace flattening and provider/model gating.
@@ -1228,6 +1291,178 @@ mod tests {
             ],
             "tool_choice":{"type":"function", "namespace":"functions", "name":"lookup"}
         })
+    }
+
+    fn private_tool_history_request() -> Value {
+        json!({
+            "model": "grok-4.7",
+            "tools": [],
+            "input": [
+                {"type":"custom_tool_call", "id":"ctc_1", "call_id":"patch_1",
+                 "name":"apply_patch", "input":"*** Begin Patch\n*** End Patch", "status":"completed"},
+                {"type":"custom_tool_call_output", "id":"cto_1", "call_id":"patch_1",
+                 "output":[{"type":"input_text","text":"Done"}]},
+                {"type":"tool_search_call", "id":"ts_1", "call_id":"search_1",
+                 "execution":"client", "arguments":{"query":"lookup","limit":2}, "status":"completed"},
+                {"type":"tool_search_output", "id":"tso_1", "call_id":"search_1",
+                 "execution":"client", "status":"completed", "tools":[
+                    {"type":"namespace","name":"discovered","tools":[
+                        {"type":"function","name":"lookup","defer_loading":true,
+                         "parameters":{"type":"object","properties":{"key":{"type":"integer"}},"required":["key"]}}
+                    ]}
+                 ]},
+                {"role":"user","content":"Continue"}
+            ]
+        })
+    }
+
+    #[test]
+    fn grok_private_tool_history_preserves_pairing_content_and_loaded_tools() {
+        use super::super::transform_codex_responses_namespace::namespace_restore_map;
+        let mut body = private_tool_history_request();
+        let original = body.clone();
+        let restore_map = namespace_restore_map(&body);
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 5);
+        for index in [0, 2] {
+            assert_eq!(body["input"][index]["type"], "function_call");
+            assert_eq!(
+                body["input"][index]["call_id"],
+                original["input"][index]["call_id"]
+            );
+            assert_eq!(body["input"][index]["id"], original["input"][index]["id"]);
+        }
+        for index in [1, 3] {
+            assert_eq!(body["input"][index]["type"], "function_call_output");
+            assert_eq!(
+                body["input"][index]["call_id"],
+                original["input"][index]["call_id"]
+            );
+            assert_eq!(body["input"][index]["id"], original["input"][index]["id"]);
+        }
+        let arguments: Value =
+            serde_json::from_str(body["input"][0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["input"], original["input"][0]["input"]);
+        assert_eq!(body["input"][1]["output"], original["input"][1]["output"]);
+        assert_eq!(body["input"][2]["name"], "tool_search");
+        let arguments: Value =
+            serde_json::from_str(body["input"][2]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, original["input"][2]["arguments"]);
+        let output: Value =
+            serde_json::from_str(body["input"][3]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["tools"], original["input"][3]["tools"]);
+        assert_eq!(body["input"][4], original["input"][4]);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "discovered__lookup");
+        assert!(tool.get("defer_loading").is_none());
+        assert_eq!(restore_map["discovered__lookup"].namespace, "discovered");
+        assert_eq!(restore_map["discovered__lookup"].name, "lookup");
+        let prepared = body.clone();
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        assert_eq!(body, prepared);
+    }
+
+    #[test]
+    fn grok_inline_namespaces_merge_children_before_flattening_and_restore() {
+        use super::super::transform_codex_responses_namespace::namespace_restore_map;
+        let group = |name: &str| {
+            json!({
+                "type":"namespace","name":"discovered","tools":[
+                    {"type":"function","name":name,"parameters":{"type":"object","properties":{}}}
+                ]
+            })
+        };
+        let mut body = private_tool_history_request();
+        body["tools"] = json!([group("first")]);
+        body["input"].as_array_mut().unwrap().insert(
+            4,
+            json!({"type":"additional_tools","tools":[group("last")]}),
+        );
+        let restore_map = namespace_restore_map(&body);
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+        for name in ["first", "lookup", "last"] {
+            let flat = format!("discovered__{name}");
+            assert!(body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == flat));
+            assert_eq!(restore_map[&flat].name, name);
+        }
+        assert_eq!(body["input"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn private_tool_history_leaves_non_grok_copilot_requests_unchanged() {
+        let mut body = private_tool_history_request();
+        body["model"] = json!("gpt-6-astra");
+        let original = body.clone();
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn private_tool_history_preserves_json_arguments_and_call_id_less_receipts() {
+        let mut body = json!({
+            "model":"grok-4.7",
+            "input":[
+                {"type":"tool_search_call","call_id":"s","arguments":"{\"query\":\"lookup\"}","execution":"client"},
+                {"type":"tool_search_output","tools":[],"output":"No tools available"},
+                {"type":"custom_tool_call_output","output":"Patch completed"}
+            ]
+        });
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        assert_eq!(body["input"][0]["arguments"], "{\"query\":\"lookup\"}");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert!(body["input"][1].to_string().contains("No tools available"));
+        assert_eq!(body["input"][2]["type"], "message");
+        assert!(body["input"][2].to_string().contains("Patch completed"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CC_SWITCH_COPILOT_SMOKE_URL; sends a billed history replay"]
+    async fn copilot_grok_live_history_replay() {
+        let url = std::env::var("CC_SWITCH_COPILOT_SMOKE_URL").expect("local proxy URL");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut body = match std::env::var("CC_SWITCH_GROK_HISTORY_FIXTURE") {
+            Ok(path) => serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+            Err(_) => private_tool_history_request(),
+        };
+        body["instructions"] = json!("Reply only HISTORY_OK. Do not call any tools.");
+        prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+        let client = reqwest::Client::new();
+        for streaming in [false, true] {
+            body["stream"] = json!(streaming);
+            let response = client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(120))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.bytes().await.unwrap();
+            assert!(
+                status.is_success(),
+                "stream={streaming}, {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let response: Value = if streaming {
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| strip_sse_field(line, "data"))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find(|event| event["type"] == "response.completed")
+                    .expect("history replay completed")["response"]
+                    .clone()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            assert_eq!(response["status"], "completed");
+        }
     }
 
     #[test]

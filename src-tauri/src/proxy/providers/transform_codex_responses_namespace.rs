@@ -46,10 +46,20 @@ pub(crate) struct NamespacedName {
 /// flatten; derives names exactly as [`flatten_request_namespaces`] does.
 pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, NamespacedName> {
     let mut map = HashMap::new();
-    let Some(tools) = request_body.get("tools").and_then(Value::as_array) else {
-        return map;
-    };
-    for tool in tools {
+    let tools = request_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let carried_tools = request_body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| is_input_tool_carrier(item))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    for tool in tools.chain(carried_tools) {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             continue;
         }
@@ -79,6 +89,13 @@ pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, Nam
         }
     }
     map
+}
+
+pub(crate) fn is_input_tool_carrier(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str).map(str::trim),
+        Some("additional_tools" | "tool_search_output")
+    )
 }
 
 /// Flatten Codex `namespace` tool declarations in a native Responses request

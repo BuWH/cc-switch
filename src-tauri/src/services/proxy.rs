@@ -23,6 +23,7 @@ pub struct ProxyService {
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
+    codex_remote: Arc<super::codex_remote_control::CodexRemoteMonitor>,
 }
 
 /// 重启失败时写回库的那份配置：设置页只动四个全局字段，旧接口是整份七个字段。
@@ -63,6 +64,7 @@ impl ProxyService {
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+            codex_remote: Arc::new(super::codex_remote_control::CodexRemoteMonitor::default()),
         }
     }
 
@@ -77,19 +79,48 @@ impl ProxyService {
         &self,
         app_type: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.switch_locks.lock_for_app(app_type).await
+        let guard = self.switch_locks.lock_for_app(app_type).await;
+        if app_type == "codex" {
+            self.codex_remote.request_check();
+        }
+        guard
+    }
+
+    pub(crate) async fn is_switch_in_progress_for_app(&self, app_type: &str) -> bool {
+        self.switch_locks.is_locked_for_app(app_type).await
+    }
+
+    pub fn start_codex_remote_monitor(&self) {
+        self.codex_remote.start(self.clone());
+    }
+
+    pub fn codex_remote_status(&self) -> super::codex_remote_control::CodexRemoteStatus {
+        self.codex_remote.status()
+    }
+
+    pub fn request_codex_remote_check(&self) {
+        self.codex_remote.request_check();
+    }
+
+    pub(crate) async fn codex_remote_takeover_enabled(&self) -> Result<bool, String> {
+        // Device-local mode, not the legacy database mirror which can sync
+        // from another machine.
+        Ok(self.is_running().await && self.get_takeover_status().await?.codex)
     }
 
     /// 启动代理服务器。成功、失败都让托盘比对一次（图标圆点、问题区、「退出」的后果跟着变）。
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
         let result = self.start_server().await;
+        self.codex_remote.request_check();
         self.notify_tray().await;
         result
     }
 
     /// 停止代理服务器。同 [`Self::start`]，结束后让托盘比对一次。
     pub async fn stop(&self) -> Result<(), String> {
+        self.codex_remote.request_check();
         let result = self.stop_server().await;
+        self.codex_remote.request_check();
         self.notify_tray().await;
         result
     }

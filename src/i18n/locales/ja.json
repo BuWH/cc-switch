@@ -1,4 +1,19 @@
 {
+  "codexRemote": {
+    "title": "Codex リモート",
+    "check": "再確認",
+    "lastChecked": "最終確認：{{time}}",
+    "nextCheck": "次回確認：{{time}}",
+    "states": {
+      "inactive": "自動復旧は無効",
+      "checking": "確認中",
+      "desktop": "デスクトップアプリが管理中。リモート接続は未検証",
+      "external": "別の app-server が管理中。変更なし",
+      "connected": "バックグラウンド接続済み",
+      "connecting": "バックグラウンド接続中",
+      "degraded": "リモート復旧の確認が必要"
+    }
+  },
   "app": {
     "title": "CC Switch",
     "description": "Claude Code・Codex・Gemini CLI のためのオールインワンアシスタント"

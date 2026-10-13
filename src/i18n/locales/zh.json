@@ -1,4 +1,19 @@
 {
+  "codexRemote": {
+    "title": "Codex 远程",
+    "check": "重新检查",
+    "lastChecked": "上次检查：{{time}}",
+    "nextCheck": "下次检查：{{time}}",
+    "states": {
+      "inactive": "自动恢复未启用",
+      "checking": "检查中",
+      "desktop": "由桌面应用管理，远程连接未独立验证",
+      "external": "由其他 app-server 管理，未做改动",
+      "connected": "后台远程已连接",
+      "connecting": "后台远程连接中",
+      "degraded": "远程恢复需要关注"
+    }
+  },
   "app": {
     "title": "CC Switch",
     "description": "Claude Code / Codex / Gemini CLI 全方位辅助工具"

@@ -205,6 +205,18 @@ pub async fn get_proxy_status(state: tauri::State<'_, AppState>) -> Result<Proxy
     state.proxy_service.get_status().await
 }
 
+#[tauri::command]
+pub fn get_codex_remote_status(
+    state: tauri::State<'_, AppState>,
+) -> crate::services::codex_remote_control::CodexRemoteStatus {
+    state.proxy_service.codex_remote_status()
+}
+
+#[tauri::command]
+pub fn check_codex_remote(state: tauri::State<'_, AppState>) {
+    state.proxy_service.request_codex_remote_check();
+}
+
 /// 获取代理配置
 #[tauri::command]
 pub async fn get_proxy_config(state: tauri::State<'_, AppState>) -> Result<ProxyConfig, String> {

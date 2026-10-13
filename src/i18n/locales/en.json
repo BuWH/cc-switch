@@ -1,4 +1,19 @@
 {
+  "codexRemote": {
+    "title": "Codex Remote",
+    "check": "Check again",
+    "lastChecked": "Last checked: {{time}}",
+    "nextCheck": "Next check: {{time}}",
+    "states": {
+      "inactive": "Automatic recovery inactive",
+      "checking": "Checking",
+      "desktop": "Managed by Desktop; remote connection not independently verified",
+      "external": "Managed by another app-server; left unchanged",
+      "connected": "Managed daemon connected",
+      "connecting": "Managed daemon connecting",
+      "degraded": "Remote recovery needs attention"
+    }
+  },
   "app": {
     "title": "CC Switch",
     "description": "All-in-One Assistant for Claude Code, Codex & Gemini CLI"

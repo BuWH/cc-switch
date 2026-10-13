@@ -795,9 +795,7 @@ async fn enter_locked(
     state.proxy_service.set_active_target(app, &route).await;
     warn_if_official_route(state, app, &route).await;
     if matches!(app, AppType::Codex) {
-        if let Err(error) = crate::services::codex_remote_control::ensure_for_active_proxy().await {
-            log::warn!("Codex Remote daemon 自动恢复失败: {error}");
-        }
+        state.proxy_service.request_codex_remote_check();
     }
     Ok(())
 }

@@ -42,6 +42,20 @@ codesign --force --deep --sign - "$staged_app"
 
 ## 早期 Patch 历史
 
+### 2026-10-13 工作树改动集成
+
+- `codex/fix-copilot-image-input` 与 `codex/fix-copilot-input-stream` 中的图片能力
+  改动合并为一份：透传 Copilot `supports.vision`，保留未知与明确不支持的区别。
+- `codex/fix-copilot-input-stream` 的原生流 ID 修复已由 `77ca5cb3` 纳入；
+  Grok 原生 Responses 兼容和额外回包路径测试由 `80244ce9` 纳入，不再复制旧实现。
+- `fix/copilot-self-forward-502-20260930` 的未提交连接重试改动已迁入：
+  只重试 Copilot 建连失败，遵守尝试次数和退避上限，不重放已发出的请求。
+- `codex/fix-remote-reliability-20260906` 的未提交代码、测试及开发文档已迁入，
+  适配当前 `mode::controller`、设备本地模式状态和设置页 `RoutingSection`。
+  原 `ProxyPanel` 与旧接管方法不恢复；测试环境仍禁止启动真实远程监控。
+- `fix/replacement-clt-validation-20260915` 的 CLT 选择逻辑已在当前替换脚本中，
+  无需再合并旧分支提交。旧工作树保留原现场；其中这些补丁已集成，不代表尚待发布。
+
 以下为历史实现记录，部分能力已被上游原生支持；不作为当前开发或发布基线。
 
 1. **`fix(proxy): treat empty choices as valid empty response on both transform paths`**

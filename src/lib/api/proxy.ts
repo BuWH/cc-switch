@@ -10,9 +10,18 @@ import type {
   CodexDaemonRestartOutcome,
   AppModeView,
   StartupAttachFailure,
+  CodexRemoteStatus,
 } from "@/types/proxy";
 
 export const proxyApi = {
+  async getCodexRemoteStatus(): Promise<CodexRemoteStatus> {
+    return invoke("get_codex_remote_status");
+  },
+
+  async checkCodexRemote(): Promise<void> {
+    return invoke("check_codex_remote");
+  },
+
   // ========== 代理服务器控制 API ==========
 
   // 启动代理服务器

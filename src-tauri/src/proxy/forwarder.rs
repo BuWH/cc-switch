@@ -48,6 +48,8 @@ use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 const COPILOT_REJECTED_MODEL_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const COPILOT_CONNECT_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const COPILOT_CONNECT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(1600);
 
 fn copilot_rejected_models() -> &'static Mutex<std::collections::HashMap<(String, String), Instant>>
 {
@@ -2847,36 +2849,63 @@ impl RequestForwarder {
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
             let client = super::http_client::get();
-            let mut request = client.request(method.clone(), &url);
-            if request_is_streaming {
-                // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
-                // 的首包/静默期超时控制，避免长流被总时长误杀。
-                request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
-            } else if !self.non_streaming_timeout.is_zero() {
-                request = request.timeout(self.non_streaming_timeout);
-            }
-            for (key, value) in &ordered_headers {
-                request = request.header(key, value);
-            }
-            let send = request.body(body_bytes).send();
-            let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
+            let request_body = Bytes::from(body_bytes);
+            let mut transport_attempt = 1usize;
+            let reqwest_resp = loop {
+                let mut request = client.request(method.clone(), &url);
+                if request_is_streaming {
+                    // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
+                    // 的首包/静默期超时控制，避免长流被总时长误杀。
+                    request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
+                } else if !self.non_streaming_timeout.is_zero() {
+                    request = request.timeout(self.non_streaming_timeout);
+                }
+                for (key, value) in &ordered_headers {
+                    request = request.header(key, value);
+                }
+
+                let send = request.body(request_body.clone()).send();
+                let send_result = if request_is_streaming {
+                    let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
+                        timeout
+                    } else {
+                        self.streaming_first_byte_timeout
+                    };
+                    tokio::time::timeout(header_timeout, send)
+                        .await
+                        .map_err(|_| {
+                            ProxyError::Timeout(format!(
+                                "流式响应首包超时: {}s（上游未返回响应头）",
+                                header_timeout.as_secs()
+                            ))
+                        })?
                 } else {
-                    self.streaming_first_byte_timeout
+                    send.await
                 };
-                tokio::time::timeout(header_timeout, send)
-                    .await
-                    .map_err(|_| {
-                        ProxyError::Timeout(format!(
-                            "流式响应首包超时: {}s（上游未返回响应头）",
-                            header_timeout.as_secs()
-                        ))
-                    })?
-            } else {
-                send.await
+
+                match send_result {
+                    Ok(response) => break response,
+                    Err(error)
+                        if should_retry_copilot_connect_error(
+                            is_copilot,
+                            error.is_connect(),
+                            transport_attempt,
+                            self.max_attempts,
+                        ) =>
+                    {
+                        let delay = copilot_connect_retry_delay(transport_attempt);
+                        log::warn!(
+                            "[Copilot] Upstream connection attempt {transport_attempt}/{} failed: {}; retrying in {}ms",
+                            self.max_attempts,
+                            error.without_url(),
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                        transport_attempt += 1;
+                    }
+                    Err(error) => return Err(map_reqwest_send_error(error)),
+                }
             };
-            let reqwest_resp = send_result.map_err(map_reqwest_send_error)?;
             ProxyResponse::Reqwest(reqwest_resp)
         } else {
             // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
@@ -4555,6 +4584,22 @@ fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
     }
 }
 
+fn should_retry_copilot_connect_error(
+    is_copilot: bool,
+    is_connect_error: bool,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    is_copilot && is_connect_error && attempt < max_attempts
+}
+
+fn copilot_connect_retry_delay(failed_attempt: usize) -> std::time::Duration {
+    let exponent = failed_attempt.saturating_sub(1).min(3) as u32;
+    COPILOT_CONNECT_RETRY_BASE_DELAY
+        .saturating_mul(2_u32.saturating_pow(exponent))
+        .min(COPILOT_CONNECT_RETRY_MAX_DELAY)
+}
+
 fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = normalized.trim();
@@ -5083,6 +5128,25 @@ mod tests {
             vec!["claude-opus-5".to_string()]
         );
         assert!(temporarily_rejected_copilot_models(provider_b).is_empty());
+    }
+
+    #[test]
+    fn copilot_connect_retries_respect_configured_attempt_limit() {
+        assert!(should_retry_copilot_connect_error(true, true, 1, 4));
+        assert!(should_retry_copilot_connect_error(true, true, 3, 4));
+        assert!(!should_retry_copilot_connect_error(true, true, 4, 4));
+        assert!(!should_retry_copilot_connect_error(true, false, 1, 4));
+        assert!(!should_retry_copilot_connect_error(false, true, 1, 4));
+        assert!(!should_retry_copilot_connect_error(true, true, 1, 1));
+    }
+
+    #[test]
+    fn copilot_connect_retry_backoff_is_bounded() {
+        assert_eq!(copilot_connect_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(copilot_connect_retry_delay(2), Duration::from_millis(400));
+        assert_eq!(copilot_connect_retry_delay(3), Duration::from_millis(800));
+        assert_eq!(copilot_connect_retry_delay(4), Duration::from_millis(1600));
+        assert_eq!(copilot_connect_retry_delay(10), Duration::from_millis(1600));
     }
 
     fn test_forwarder(
@@ -7047,6 +7111,7 @@ mod tests {
                 context_window: Some(400_000),
                 supported_endpoints: endpoints.into_iter().map(str::to_string).collect(),
                 supports_parallel_tool_calls: None,
+                supports_vision: None,
                 reasoning_effort: None,
             }];
             let mut body = json!({"model": "GPT-5.6", "input": "Hello"});

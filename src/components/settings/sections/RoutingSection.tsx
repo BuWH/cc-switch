@@ -23,6 +23,7 @@ import { HelpTip, DisabledReason } from "@/components/ui/help-tip";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { AutoFailoverConfigPanel } from "@/components/proxy/AutoFailoverConfigPanel";
+import { CodexRemoteStatusRow } from "@/components/proxy/CodexRemoteStatusRow";
 import { RectifierConfigPanel } from "@/components/settings/RectifierConfigPanel";
 import { APP_DISPLAY_NAME, AppGlyph } from "@/components/shell/AppGlyph";
 import { MODE_TONE } from "@/components/providers/mode/ModeTabs";
@@ -420,6 +421,9 @@ export function RoutingSection({ onOpenApp }: RoutingSectionProps) {
                 })}
                 onOpen={() => onOpenApp("claude-desktop")}
               />
+            )}
+            {running && usingApps.some(({ app }) => app === "codex") && (
+              <CodexRemoteStatusRow />
             )}
           </SettingsCard>
         )}

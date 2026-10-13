@@ -833,9 +833,12 @@ export function CodexFormFields({
                   model.supports_parallel_tool_calls ??
                   existing.get(model.id)?.supportsParallelToolCalls ??
                   false,
-                inputModalities: existing.get(model.id)?.inputModalities ?? [
-                  "text",
-                ],
+                inputModalities:
+                  model.supports_vision !== undefined
+                    ? model.supports_vision
+                      ? ["text", "image"]
+                      : ["text"]
+                    : existing.get(model.id)?.inputModalities,
                 ...(model.reasoning_effort !== undefined
                   ? { reasoningLevels: model.reasoning_effort }
                   : {}),

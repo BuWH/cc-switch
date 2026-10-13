@@ -264,7 +264,7 @@ describe("Codex model-fetch lifecycle", () => {
             displayName: "Model One",
             contextWindow: 400_000,
             supportsParallelToolCalls: false,
-            inputModalities: ["text"],
+            inputModalities: undefined,
           },
         ]);
       } else {
@@ -378,6 +378,7 @@ describe("Codex model-fetch lifecycle", () => {
         ...advertisedModel(),
         context_window: 922_000,
         supports_parallel_tool_calls: true,
+        supports_vision: true,
         reasoning_effort: ["none", "low", "medium", "high", "xhigh"],
       },
     ]);
@@ -388,6 +389,7 @@ describe("Codex model-fetch lifecycle", () => {
           model: "model-1",
           contextWindow: 1_048_576,
           supportsParallelToolCalls: false,
+          inputModalities: ["text"],
           reasoningLevels: ["max"],
           baseInstructions: "Keep me",
         },
@@ -402,6 +404,7 @@ describe("Codex model-fetch lifecycle", () => {
           model: "model-1",
           contextWindow: 922_000,
           supportsParallelToolCalls: true,
+          inputModalities: ["text", "image"],
           reasoningLevels: ["none", "low", "medium", "high", "xhigh"],
           baseInstructions: "Keep me",
         }),
@@ -423,6 +426,7 @@ describe("Codex model-fetch lifecycle", () => {
           model: "model-1",
           contextWindow: 222_000,
           supportsParallelToolCalls: true,
+          inputModalities: ["text", "image"],
           reasoningLevels: ["high", "max"],
         },
       ],
@@ -436,7 +440,48 @@ describe("Codex model-fetch lifecycle", () => {
           model: "model-1",
           contextWindow: 222_000,
           supportsParallelToolCalls: true,
+          inputModalities: ["text", "image"],
           reasoningLevels: ["high", "max"],
+        }),
+      ]),
+    );
+  });
+
+  it("does not declare new models text-only when Copilot omits vision metadata", async () => {
+    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
+      advertisedModel(),
+    ]);
+    const onCatalogModelsChange = vi.fn();
+    const props = {
+      ...makeProps("copilot"),
+      catalogModels: [],
+      onCatalogModelsChange,
+    };
+    render(<Harness {...props} />);
+    fireEvent.click(fetchButton());
+
+    await waitFor(() => expect(props.onCatalogModelsChange).toHaveBeenCalled());
+    expect(
+      onCatalogModelsChange.mock.calls[0][0][0].inputModalities,
+    ).toBeUndefined();
+  });
+
+  it("honors an explicit text-only capability from Copilot", async () => {
+    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
+      { ...advertisedModel(), supports_vision: false },
+    ]);
+    const props = {
+      ...makeProps("copilot"),
+      catalogModels: [{ model: "model-1", inputModalities: ["text", "image"] }],
+    };
+    render(<Harness {...props} />);
+    fireEvent.click(fetchButton());
+
+    await waitFor(() =>
+      expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+        expect.objectContaining({
+          model: "model-1",
+          inputModalities: ["text"],
         }),
       ]),
     );

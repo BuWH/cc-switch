@@ -279,6 +279,9 @@ pub struct CopilotModel {
     /// Whether the model supports parallel tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_parallel_tool_calls: Option<bool>,
+    /// Whether Copilot advertises image input for this exact model ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Copilot-reported reasoning effort levels supported by this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<Vec<CopilotReasoningEffort>>,
@@ -365,6 +368,10 @@ fn extract_copilot_parallel_tool_calls(capabilities: Option<&Value>) -> Option<b
     capabilities?
         .pointer("/supports/parallel_tool_calls")?
         .as_bool()
+}
+
+fn extract_copilot_vision(capabilities: Option<&Value>) -> Option<bool> {
+    capabilities?.pointer("/supports/vision")?.as_bool()
 }
 
 fn extract_copilot_reasoning_effort(
@@ -1143,6 +1150,7 @@ impl CopilotAuthManager {
                     m.capabilities.as_ref(),
                 ),
                 reasoning_effort: extract_copilot_reasoning_effort(m.capabilities.as_ref()),
+                supports_vision: extract_copilot_vision(m.capabilities.as_ref()),
             })
             .collect();
 
@@ -1838,6 +1846,7 @@ mod tests {
                 },
                 "supports": {
                     "parallel_tool_calls": true,
+                    "vision": true,
                     "reasoning_effort": ["none", "low", "turbo", "max", 7]
                 }
             }
@@ -1850,6 +1859,10 @@ mod tests {
         );
         assert_eq!(
             extract_copilot_parallel_tool_calls(item.capabilities.as_ref()),
+            Some(true)
+        );
+        assert_eq!(
+            extract_copilot_vision(item.capabilities.as_ref()),
             Some(true)
         );
         assert_eq!(
@@ -1893,6 +1906,25 @@ mod tests {
     }
 
     #[test]
+    fn vision_preserves_explicit_false_and_unknown_capabilities() {
+        assert_eq!(extract_copilot_vision(None), None);
+        for capabilities in [
+            serde_json::json!({}),
+            serde_json::json!({"supports": {}}),
+            serde_json::json!({"supports": {"vision": null}}),
+            serde_json::json!({"supports": {"vision": "true"}}),
+        ] {
+            assert_eq!(extract_copilot_vision(Some(&capabilities)), None);
+        }
+        assert_eq!(
+            extract_copilot_vision(Some(&serde_json::json!({
+                "supports": {"vision": false}
+            }))),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn serializes_optional_live_model_capabilities() {
         let model = CopilotModel {
             id: "gpt-5.6-sol".to_string(),
@@ -1902,6 +1934,7 @@ mod tests {
             context_window: Some(922_000),
             supported_endpoints: vec!["/responses".to_string()],
             supports_parallel_tool_calls: Some(true),
+            supports_vision: Some(true),
             reasoning_effort: Some(vec![
                 CopilotReasoningEffort::None,
                 CopilotReasoningEffort::Xhigh,
@@ -1919,6 +1952,7 @@ mod tests {
                 "context_window": 922000,
                 "supported_endpoints": ["/responses"],
                 "supports_parallel_tool_calls": true,
+                "supports_vision": true,
                 "reasoning_effort": ["none", "xhigh", "max"]
             })
         );
@@ -2169,6 +2203,7 @@ mod tests {
                             context_window: None,
                             supported_endpoints: Vec::new(),
                             supports_parallel_tool_calls: None,
+                            supports_vision: None,
                             reasoning_effort: None,
                         },
                         CopilotModel {
@@ -2179,6 +2214,7 @@ mod tests {
                             context_window: None,
                             supported_endpoints: Vec::new(),
                             supports_parallel_tool_calls: None,
+                            supports_vision: None,
                             reasoning_effort: None,
                         },
                         CopilotModel {
@@ -2192,6 +2228,7 @@ mod tests {
                                 "/responses".to_string(),
                             ],
                             supports_parallel_tool_calls: None,
+                            supports_vision: None,
                             reasoning_effort: None,
                         },
                     ]),
@@ -2279,6 +2316,7 @@ mod tests {
                 .map(|endpoint| endpoint.to_string())
                 .collect(),
             supports_parallel_tool_calls: None,
+            supports_vision: None,
             reasoning_effort: None,
         };
         for (account, models) in [
@@ -2371,6 +2409,7 @@ mod tests {
             model_picker_enabled: true,
             context_window: None,
             supports_parallel_tool_calls: None,
+            supports_vision: None,
             reasoning_effort: None,
             supported_endpoints: endpoints
                 .iter()

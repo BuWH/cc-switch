@@ -13,12 +13,31 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 import { getAppLabel } from "@/config/appConfig";
 
 export const proxyKeys = {
+  codexRemote: ["codexRemoteStatus"] as const,
   status: ["proxyStatus"] as const,
   takeoverStatus: ["proxyTakeoverStatus"] as const,
   globalConfig: ["globalProxyConfig"] as const,
   clientHost: ["proxyClientHost"] as const,
   appConfig: (appType: string) => ["appProxyConfig", appType] as const,
 };
+
+export function useCodexRemoteStatus() {
+  return useQuery({
+    queryKey: proxyKeys.codexRemote,
+    queryFn: () => proxyApi.getCodexRemoteStatus(),
+    refetchInterval: 5000,
+    staleTime: 2000,
+  });
+}
+
+export function useCheckCodexRemote() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => proxyApi.checkCodexRemote(),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: proxyKeys.codexRemote }),
+  });
+}
 
 // ========== 代理服务器状态 Hooks ==========
 

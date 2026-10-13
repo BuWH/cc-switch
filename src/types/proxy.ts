@@ -29,6 +29,22 @@ export interface ProxyStatus {
   active_targets?: ActiveTarget[];
 }
 
+export interface CodexRemoteStatus {
+  state:
+    | "inactive"
+    | "checking"
+    | "desktop"
+    | "external"
+    | "connected"
+    | "connecting"
+    | "degraded";
+  lastCheckedAt: string | null;
+  lastConnectedAt: string | null;
+  lastError: string | null;
+  nextCheckAt: string | null;
+  cliPath: string | null;
+}
+
 export interface ActiveTarget {
   app_type: string;
   provider_name: string;

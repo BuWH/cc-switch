@@ -1256,6 +1256,7 @@ pub fn run() {
                 // 定下各应用的直连 / 代理模式（处理旧版遗留的接管状态），再把代理模式的
                 // 应用接上。要排在通用配置片段的自动提取之后：它读的是直连的 live。
                 crate::mode::controller::startup(&state).await;
+                state.proxy_service.start_codex_remote_monitor();
                 // 启动流程走完：托盘这时才开始报「路由服务没在运行」，并记下退回直连的应用。
                 crate::tray::mark_startup_settled(&app_handle);
                 // Codex 官方做路由、发布了 Stack 模型时，官方模型列表过期就在后台刷新。
@@ -1608,6 +1609,8 @@ pub fn run() {
             commands::exit_proxy_apps_in_mode,
             commands::get_direct_provider,
             commands::get_proxy_status,
+            commands::get_codex_remote_status,
+            commands::check_codex_remote,
             commands::get_proxy_config,
             commands::update_proxy_config,
             // Global & Per-App Config

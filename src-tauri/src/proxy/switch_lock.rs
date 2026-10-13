@@ -39,4 +39,27 @@ impl SwitchLockManager {
         };
         lock.lock_owned().await
     }
+
+    pub async fn is_locked_for_app(&self, app_type: &str) -> bool {
+        let locks = self.locks.read().await;
+        locks
+            .get(app_type)
+            .is_some_and(|lock| lock.try_lock().is_err())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn switch_probe_tracks_only_the_requested_app_without_waiting() {
+        let locks = SwitchLockManager::new();
+        assert!(!locks.is_locked_for_app("codex").await);
+        let guard = locks.lock_for_app("codex").await;
+        assert!(locks.is_locked_for_app("codex").await);
+        assert!(!locks.is_locked_for_app("claude").await);
+        drop(guard);
+        assert!(!locks.is_locked_for_app("codex").await);
+    }
 }

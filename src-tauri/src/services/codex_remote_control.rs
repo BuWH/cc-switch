@@ -1,389 +1,659 @@
+//! Non-disruptive Remote Control recovery. Desktop owns the connection while
+//! present; an existing managed daemon yields only its ephemeral remote worker.
+
+mod desktop;
+mod process;
+#[cfg(test)]
+mod tests;
+
+use process::{output_text, CheckControl};
+use serde::Serialize;
 use serde_json::Value;
-#[cfg(not(test))]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const OWNER_POLL: Duration = Duration::from_secs(5);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+const STALLED_CONNECTION: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexRemoteDaemonAction {
-    AlreadyRunning,
-    Bootstrapped,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteState {
+    #[default]
+    Inactive,
+    Checking,
+    Desktop,
+    External,
+    Connected,
+    Connecting,
+    Degraded,
 }
 
-#[cfg(not(test))]
-fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
-    // A single-component path is a PATH lookup such as `codex`; absolute and
-    // multi-component candidates must exist before we try to execute them.
-    if path.components().count() > 1 && !path.exists() {
-        return;
-    }
-    let key = path.to_string_lossy().into_owned();
-    if seen.insert(key) {
-        candidates.push(path);
-    }
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRemoteStatus {
+    pub state: RemoteState,
+    pub last_checked_at: Option<String>,
+    pub last_connected_at: Option<String>,
+    pub last_error: Option<String>,
+    pub next_check_at: Option<String>,
+    pub cli_path: Option<String>,
 }
 
-#[cfg(not(test))]
-fn codex_remote_daemon_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    let codex_home = crate::codex_config::get_codex_config_dir();
-    let home = crate::config::get_home_dir();
-
-    #[cfg(target_os = "windows")]
-    {
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            codex_home.join("packages/standalone/current/bin/codex.exe"),
-        );
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            codex_home.join("packages/standalone/current/codex.exe"),
-        );
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            home.join(".local/bin/codex.exe"),
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            codex_home.join("packages/standalone/current/bin/codex"),
-        );
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            codex_home.join("packages/standalone/current/codex"),
-        );
-        push_candidate(&mut candidates, &mut seen, home.join(".local/bin/codex"));
-    }
-
-    #[cfg(target_os = "macos")]
-    push_candidate(
-        &mut candidates,
-        &mut seen,
-        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
-    );
-
-    // Keep the established CLI discovery list as a fallback for standalone
-    // installs managed by Homebrew, npm, nvm, fnm, mise, or pnpm.
-    for candidate in crate::codex_config::codex_cli_candidates() {
-        push_candidate(&mut candidates, &mut seen, candidate);
-    }
-
-    candidates
+#[derive(Default)]
+pub struct CodexRemoteMonitor {
+    started: AtomicBool,
+    epoch: Arc<AtomicU64>,
+    notify: Notify,
+    status: Mutex<CodexRemoteStatus>,
 }
 
-fn daemon_command(candidate: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(candidate);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW);
+impl CodexRemoteMonitor {
+    pub fn status(&self) -> CodexRemoteStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
-    command
-}
-
-fn output_text(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (false, false) => format!("{stdout}; {stderr}"),
-        (false, true) => stdout,
-        (true, false) => stderr,
-        (true, true) => "no output".to_string(),
+    pub fn request_check(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        if self.started.load(Ordering::Acquire) {
+            self.status.lock().unwrap_or_else(|e| e.into_inner()).state = RemoteState::Checking;
+        }
+        self.notify.notify_one();
     }
-}
 
-fn daemon_status(output: &Output) -> Option<String> {
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice::<Value>(&output.stdout)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-}
-
-fn remote_control_is_connected(output: &Output) -> bool {
-    if !output.status.success() {
-        return false;
-    }
-    serde_json::from_slice::<Value>(&output.stdout)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
-}
-
-fn start_remote_control(candidate: &Path) -> Result<Output, String> {
-    daemon_command(candidate, &["remote-control", "start", "--json"])
-        .output()
-        .map_err(|error| format!("{}: {error}", candidate.display()))
-}
-
-fn ensure_with_candidates(
-    candidates: impl IntoIterator<Item = PathBuf>,
-) -> Result<CodexRemoteDaemonAction, String> {
-    let mut diagnostics = Vec::new();
-
-    for candidate in candidates {
-        let version =
-            match daemon_command(&candidate, &["app-server", "daemon", "version"]).output() {
-                Ok(output) => output,
-                Err(error) => {
-                    diagnostics.push(format!("{}: {error}", candidate.display()));
+    pub fn start(self: &Arc<Self>, service: super::proxy::ProxyService) {
+        // Integration tests compile the library without cfg(test). Never
+        // inspect or mutate the real user's daemon from a test HOME.
+        if cfg!(test) || std::env::var_os("CC_SWITCH_TEST_HOME").is_some() {
+            return;
+        }
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let monitor = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut worker = Worker::default();
+            let mut forced = false;
+            loop {
+                forced |= tokio::select! {
+                    _ = monitor.notify.notified() => true,
+                    _ = tokio::time::sleep(OWNER_POLL) => false,
+                };
+                let generation = monitor.epoch.load(Ordering::Acquire);
+                // Config writers invalidate the epoch; no provider switch lock
+                // is held across a process or network operation.
+                if service.is_switch_in_progress_for_app("codex").await {
                     continue;
                 }
-            };
-
-        if let Some(status) = daemon_status(&version) {
-            if status.eq_ignore_ascii_case("running") {
-                let started = start_remote_control(&candidate)?;
-                if remote_control_is_connected(&started) {
-                    return Ok(CodexRemoteDaemonAction::AlreadyRunning);
+                match service.codex_remote_takeover_enabled().await {
+                    Ok(false) => {
+                        worker = Worker::default();
+                        *monitor.status.lock().unwrap_or_else(|e| e.into_inner()) =
+                            CodexRemoteStatus::default();
+                        continue;
+                    }
+                    Err(error) => {
+                        monitor.publish(Err(error), OWNER_POLL, None);
+                        continue;
+                    }
+                    Ok(true) => {}
                 }
-                diagnostics.push(format!(
-                    "{} remote-control start: {}",
-                    candidate.display(),
-                    output_text(&started)
-                ));
+                let control = CheckControl {
+                    epoch: monitor.epoch.clone(),
+                    generation,
+                    deadline: Instant::now() + CHECK_TIMEOUT,
+                };
+                let mut next_worker = worker.clone();
+                let force_check = forced;
+                forced = false;
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    let outcome =
+                        Execution::for_active_proxy(control).and_then(
+                            |execution| match execution {
+                                Some(execution) => {
+                                    next_worker.tick(&execution, force_check, desktop::running)
+                                }
+                                None => Ok(Some(CheckResult::new(RemoteState::Inactive, None))),
+                            },
+                        );
+                    (next_worker, outcome)
+                })
+                .await;
+                if monitor.epoch.load(Ordering::Acquire) != generation {
+                    continue;
+                }
+                match result {
+                    Ok((next_worker, outcome)) => {
+                        worker = next_worker;
+                        match outcome {
+                            Ok(None) => {}
+                            result => monitor.publish(
+                                result.and_then(|value| {
+                                    value.ok_or("Missing remote check result".into())
+                                }),
+                                worker.next_check.saturating_duration_since(Instant::now()),
+                                worker.selected.as_deref(),
+                            ),
+                        }
+                    }
+                    Err(error) => monitor.publish(Err(error.to_string()), OWNER_POLL, None),
+                }
+            }
+        });
+        self.notify.notify_one();
+    }
+
+    fn publish(&self, result: Result<CheckResult, String>, delay: Duration, cli: Option<&Path>) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = chrono::Utc::now();
+        status.last_checked_at = Some(now.to_rfc3339());
+        status.next_check_at =
+            Some((now + chrono::Duration::seconds(delay.as_secs().max(1) as i64)).to_rfc3339());
+        status.cli_path = cli.map(|path| path.display().to_string());
+        match result {
+            Ok(result) => {
+                if status.state != result.state || status.last_error.is_some() {
+                    log::info!("Codex Remote health: {:?}", result.state);
+                }
+                status.state = result.state;
+                status.last_error = None;
+                if result.state == RemoteState::Connected {
+                    status.last_connected_at = status.last_checked_at.clone();
+                }
+                if result.state == RemoteState::Inactive {
+                    status.next_check_at = None;
+                }
+            }
+            Err(error) => {
+                if status.last_error.as_ref() != Some(&error) {
+                    log::warn!("Codex Remote recovery deferred: {error}");
+                }
+                status.state = RemoteState::Degraded;
+                status.last_error = Some(error);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Worker {
+    selected: Option<PathBuf>,
+    desktop: Option<bool>,
+    next_check: Instant,
+    failures: u32,
+    connecting_since: Option<Instant>,
+    last_tick: Option<SystemTime>,
+    socket_modified: Option<SystemTime>,
+}
+
+impl Default for Worker {
+    fn default() -> Self {
+        Self {
+            selected: None,
+            desktop: None,
+            next_check: Instant::now(),
+            failures: 0,
+            connecting_since: None,
+            last_tick: None,
+            socket_modified: None,
+        }
+    }
+}
+
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(5 * (1u64 << failures.saturating_sub(1).min(5)))
+        .min(Duration::from_secs(120))
+}
+
+impl Worker {
+    fn tick(
+        &mut self,
+        execution: &Execution,
+        forced: bool,
+        mut desktop_probe: impl FnMut(&CheckControl) -> Result<bool, String>,
+    ) -> Result<Option<CheckResult>, String> {
+        let resumed = self
+            .last_tick
+            .is_some_and(|last| last.elapsed().unwrap_or(HEALTH_INTERVAL) > OWNER_POLL * 3);
+        self.last_tick = Some(SystemTime::now());
+        let desktop = desktop_probe(&execution.control)?;
+        let owner_changed = self.desktop != Some(desktop);
+        let socket_modified = std::fs::metadata(
+            execution
+                .home
+                .join("app-server-control/app-server-control.sock"),
+        )
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+        let socket_changed = self.socket_modified != socket_modified;
+        self.socket_modified = socket_modified;
+        if !forced
+            && !resumed
+            && !owner_changed
+            && !socket_changed
+            && Instant::now() < self.next_check
+        {
+            return Ok(None);
+        }
+        self.desktop = Some(desktop);
+        let stalled = self
+            .connecting_since
+            .is_some_and(|since| since.elapsed() >= STALLED_CONNECTION);
+        let result = reconcile(execution, desktop, stalled, &mut desktop_probe);
+        let delay = match &result {
+            Ok(result) => {
+                self.selected = result.cli.clone();
+                if result.state == RemoteState::Connecting {
+                    if stalled || self.connecting_since.is_none() {
+                        self.connecting_since = Some(Instant::now());
+                    }
+                    OWNER_POLL
+                } else {
+                    self.connecting_since = None;
+                    HEALTH_INTERVAL
+                }
+            }
+            Err(_) => {
+                self.failures = self.failures.saturating_add(1);
+                retry_delay(self.failures)
+            }
+        };
+        if result.is_ok() {
+            self.failures = 0;
+        }
+        self.next_check = Instant::now() + delay;
+        result.map(Some)
+    }
+}
+
+#[derive(Debug)]
+struct CheckResult {
+    state: RemoteState,
+    cli: Option<PathBuf>,
+}
+
+impl CheckResult {
+    fn new(state: RemoteState, cli: Option<&Path>) -> Self {
+        Self {
+            state,
+            cli: cli.map(Path::to_path_buf),
+        }
+    }
+}
+
+struct Execution {
+    home: PathBuf,
+    candidates: Vec<PathBuf>,
+    control: CheckControl,
+}
+
+impl Execution {
+    fn for_active_proxy(control: CheckControl) -> Result<Option<Self>, String> {
+        let home = crate::codex_config::get_codex_config_dir();
+        let auth: Value = crate::config::read_json_file(&home.join("auth.json"))
+            .map_err(|error| format!("Cannot read Codex login: {error}"))?;
+        if !crate::codex_config::codex_auth_has_chatgpt_login_material(&auth) {
+            return Ok(None);
+        }
+        let config =
+            std::fs::read_to_string(home.join("config.toml")).map_err(|error| error.to_string())?;
+        if !crate::codex_config::codex_config_active_provider_requires_openai_auth(&config) {
+            return Ok(None);
+        }
+        let config: toml::Value = toml::from_str(&config).map_err(|error| error.to_string())?;
+        if config
+            .get("features")
+            .and_then(|f| f.get("remote_control"))
+            .and_then(toml::Value::as_bool)
+            != Some(true)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            candidates: candidates(&home),
+            home,
+            control,
+        }))
+    }
+
+    fn command(&self, candidate: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(candidate);
+        command.args(args).env("CODEX_HOME", &self.home);
+        let mut runtimes = crate::codex_config::codex_cli_candidates();
+        runtimes.extend(node_candidates(&crate::config::get_home_dir()));
+        runtimes.extend(self.candidates.iter().cloned());
+        command.env("PATH", cli_path(candidate, &runtimes));
+        command
+    }
+
+    fn run(&self, candidate: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
+        process::run(self.command(candidate, args), timeout, &self.control)
+            .map_err(|error| format!("{} {}: {error}", candidate.display(), args.join(" ")))
+    }
+
+    fn rpc(&self, candidate: &Path, method: &str) -> Result<Value, String> {
+        process::rpc(
+            self.command(candidate, &["app-server", "proxy"]),
+            &self.home,
+            method,
+            &self.control,
+        )
+    }
+}
+
+fn candidates(home: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |path: PathBuf| {
+        if path.components().count() > 1 && !path.is_file() {
+            return;
+        }
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            result.push(path);
+        }
+    };
+    // Prefer Desktop's current protocol client. The daemon command itself
+    // still selects Codex's managed standalone binary.
+    #[cfg(target_os = "macos")]
+    for path in [
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+    ] {
+        add(PathBuf::from(path));
+    }
+    let executable = if cfg!(windows) { "codex.exe" } else { "codex" };
+    add(home
+        .join("packages/standalone/current/bin")
+        .join(executable));
+    add(home.join("packages/standalone/current").join(executable));
+    for path in crate::codex_config::codex_cli_candidates() {
+        add(path);
+    }
+    result
+}
+
+fn cli_path(candidate: &Path, candidates: &[PathBuf]) -> std::ffi::OsString {
+    cli_path_with_inherited(candidate, candidates, std::env::var_os("PATH").as_deref())
+}
+
+fn node_candidates(home: &Path) -> Vec<PathBuf> {
+    let node = if cfg!(windows) { "node.exe" } else { "node" };
+    let mut result = Vec::new();
+    for relative in [
+        ".local/bin",
+        ".volta/bin",
+        ".asdf/shims",
+        ".local/share/mise/shims",
+        ".config/mise/shims",
+    ] {
+        result.push(home.join(relative).join(node));
+    }
+    let mut roots = vec![
+        (home.join(".nvm/versions/node"), "bin"),
+        (
+            home.join(".local/share/fnm/node-versions"),
+            "installation/bin",
+        ),
+        (
+            home.join("Library/Application Support/fnm/node-versions"),
+            "installation/bin",
+        ),
+    ];
+    if let Some(nvm) = std::env::var_os("NVM_DIR") {
+        roots.push((PathBuf::from(nvm).join("versions/node"), "bin"));
+    }
+    if let Some(fnm) = std::env::var_os("FNM_DIR") {
+        roots.push((PathBuf::from(fnm).join("node-versions"), "installation/bin"));
+    }
+    for (root, suffix) in roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let mut nodes = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join(suffix).join(node))
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            nodes.sort_by(|a, b| b.cmp(a));
+            result.extend(nodes);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        result.push(PathBuf::from(program_files).join("nodejs").join(node));
+    }
+    result
+}
+
+fn cli_path_with_inherited(
+    candidate: &Path,
+    candidates: &[PathBuf],
+    inherited: Option<&std::ffi::OsStr>,
+) -> std::ffi::OsString {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |path: PathBuf| {
+        if path.is_absolute() && seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
+    if let Some(parent) = candidate.parent() {
+        add(parent.to_path_buf());
+    }
+    let node = if cfg!(windows) { "node.exe" } else { "node" };
+    for path in candidates {
+        if let Some(parent) = path.parent().filter(|parent| parent.join(node).is_file()) {
+            add(parent.to_path_buf());
+        }
+    }
+    if let Some(inherited) = inherited {
+        for path in std::env::split_paths(inherited) {
+            add(path);
+        }
+    }
+    // GUI PATH may omit Node. Reuse nvm/fnm/mise/npm discovery without
+    // executing the user's login shell.
+    for path in candidates {
+        if let Some(parent) = path.parent() {
+            add(parent.to_path_buf());
+        }
+    }
+    #[cfg(unix)]
+    for path in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        add(path.into());
+    }
+    std::env::join_paths(paths).unwrap_or_default()
+}
+
+fn status(value: &Value) -> Result<&str, String> {
+    value
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or("Codex returned no status".into())
+}
+
+fn unavailable_socket(output: &Output) -> bool {
+    let text = output_text(output).to_ascii_lowercase();
+    !output.status.success()
+        && text.contains("failed to connect")
+        && text.contains("app-server-control")
+        && [
+            "no such file",
+            "connection refused",
+            "os error 2",
+            "os error 61",
+            "os error 111",
+            "os error 10061",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn remote_state(value: &Value) -> Result<RemoteState, String> {
+    match status(value)? {
+        "connected" => Ok(RemoteState::Connected),
+        "connecting" => Ok(RemoteState::Connecting),
+        other => Err(format!("Codex Remote is {other}")),
+    }
+}
+
+fn reconcile(
+    execution: &Execution,
+    desktop: bool,
+    stalled: bool,
+    desktop_probe: &mut impl FnMut(&CheckControl) -> Result<bool, String>,
+) -> Result<CheckResult, String> {
+    let socket = execution
+        .home
+        .join("app-server-control/app-server-control.sock");
+    if desktop && !socket.exists() {
+        return Ok(CheckResult::new(RemoteState::Desktop, None));
+    }
+    let mut diagnostics = Vec::new();
+    for candidate in &execution.candidates {
+        execution.control.check()?;
+        let version = match execution.run(
+            candidate,
+            &["app-server", "daemon", "version"],
+            Duration::from_secs(4),
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                diagnostics.push(error);
                 continue;
             }
-
-            let bootstrapped = daemon_command(
-                &candidate,
-                &["app-server", "daemon", "bootstrap", "--remote-control"],
-            )
-            .output()
-            .map_err(|error| format!("{}: {error}", candidate.display()))?;
-            if bootstrapped.status.success() {
-                let started = start_remote_control(&candidate)?;
-                if remote_control_is_connected(&started) {
-                    return Ok(CodexRemoteDaemonAction::Bootstrapped);
-                }
-                diagnostics.push(format!(
-                    "{} remote-control start after bootstrap: {}",
-                    candidate.display(),
-                    output_text(&started)
-                ));
-                continue;
-            }
+        };
+        let version_json = serde_json::from_slice::<Value>(&version.stdout).ok();
+        let lifecycle = version_json.as_ref().and_then(|value| status(value).ok());
+        let stopped = unavailable_socket(&version)
+            || (version.status.success() && matches!(lifecycle, Some("stopped" | "notRunning")));
+        let running = version.status.success() && lifecycle == Some("running");
+        if !stopped && !running {
             diagnostics.push(format!(
-                "{} bootstrap --remote-control: {}",
+                "{}: {}",
                 candidate.display(),
-                output_text(&bootstrapped)
+                output_text(&version)
             ));
             continue;
         }
-
-        diagnostics.push(format!(
-            "{}: {}",
-            candidate.display(),
-            output_text(&version)
-        ));
+        if running
+            && version_json
+                .as_ref()
+                .and_then(|v| v.get("backend"))
+                .and_then(Value::as_str)
+                != Some("pid")
+        {
+            return Ok(CheckResult::new(RemoteState::External, Some(candidate)));
+        }
+        if stopped {
+            if desktop || desktop_probe(&execution.control)? {
+                return Ok(CheckResult::new(RemoteState::Desktop, Some(candidate)));
+            }
+            // Capability and liveness are separate. Bootstrap is deliberately
+            // avoided: it can stop tasks and restart an existing updater.
+            let help = match execution.run(
+                candidate,
+                &["app-server", "daemon", "start", "--help"],
+                Duration::from_secs(4),
+            ) {
+                Ok(help) => help,
+                Err(error) => {
+                    diagnostics.push(error);
+                    continue;
+                }
+            };
+            if !help.status.success() {
+                diagnostics.push(format!(
+                    "{}: daemon start is unsupported",
+                    candidate.display()
+                ));
+                continue;
+            }
+            if desktop_probe(&execution.control)? {
+                return Ok(CheckResult::new(RemoteState::Desktop, Some(candidate)));
+            }
+            let started = execution.run(
+                candidate,
+                &["app-server", "daemon", "start"],
+                Duration::from_secs(20),
+            )?;
+            if !started.status.success() {
+                return Err(format!(
+                    "Cannot start the managed Codex daemon: {}",
+                    output_text(&started)
+                ));
+            }
+            let verified = execution.run(
+                candidate,
+                &["app-server", "daemon", "version"],
+                Duration::from_secs(4),
+            )?;
+            let verified: Value = serde_json::from_slice(&verified.stdout)
+                .ok()
+                .filter(|_| verified.status.success())
+                .ok_or("Could not verify the started Codex daemon")?;
+            if verified.get("backend").and_then(Value::as_str) != Some("pid") {
+                return Ok(CheckResult::new(RemoteState::External, Some(candidate)));
+            }
+        }
+        let mut remote = match execution.rpc(candidate, "remoteControl/status/read") {
+            Ok(remote) => remote,
+            Err(error) => {
+                diagnostics.push(format!("{}: {error}", candidate.display()));
+                continue;
+            }
+        };
+        if desktop || desktop_probe(&execution.control)? {
+            if status(&remote)? != "disabled" {
+                remote = execution.rpc(candidate, "remoteControl/disable")?;
+                if status(&remote)? != "disabled" {
+                    return Err(
+                        "Managed daemon did not yield its remote connection to Desktop".into(),
+                    );
+                }
+            }
+            return Ok(CheckResult::new(RemoteState::Desktop, Some(candidate)));
+        }
+        if status(&remote)? == "errored" || (stalled && status(&remote)? == "connecting") {
+            let disabled = execution.rpc(candidate, "remoteControl/disable")?;
+            if status(&disabled)? != "disabled" {
+                return Err("Codex Remote worker did not stop; reconnect deferred".into());
+            }
+            if desktop_probe(&execution.control)? {
+                return Ok(CheckResult::new(RemoteState::Desktop, Some(candidate)));
+            }
+            remote = execution.rpc(candidate, "remoteControl/enable")?;
+        } else if status(&remote)? == "disabled" {
+            remote = execution.rpc(candidate, "remoteControl/enable")?;
+        }
+        // Desktop can appear during a command. Yield without killing either
+        // app-server or changing persisted login/enrollment preferences.
+        if desktop_probe(&execution.control)? {
+            let yielded = execution.rpc(candidate, "remoteControl/disable")?;
+            if status(&yielded)? != "disabled" {
+                return Err("Managed daemon did not yield its remote connection to Desktop".into());
+            }
+            return Ok(CheckResult::new(RemoteState::Desktop, Some(candidate)));
+        }
+        return Ok(CheckResult::new(remote_state(&remote)?, Some(candidate)));
     }
-
     Err(format!(
-        "未找到支持 Remote daemon 的 Codex standalone CLI。请使用 Codex 官方安装器安装最新版 CLI。探测结果: {}",
-        diagnostics.join(" | ")
+        "Codex Remote check failed: {}",
+        diagnostics
+            .join(" | ")
+            .chars()
+            .take(4000)
+            .collect::<String>()
     ))
-}
-
-#[cfg(not(test))]
-fn active_proxy_uses_chatgpt_auth() -> bool {
-    let auth_path = crate::codex_config::get_codex_auth_path();
-    let config_path = crate::codex_config::get_codex_config_path();
-    let Ok(auth) = crate::config::read_json_file::<Value>(&auth_path) else {
-        return false;
-    };
-    if !crate::codex_config::codex_auth_has_chatgpt_login_material(&auth) {
-        return false;
-    }
-    let Ok(config_text) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    crate::codex_config::codex_config_active_provider_requires_openai_auth(&config_text)
-}
-
-#[cfg(not(test))]
-pub async fn ensure_for_active_proxy() -> Result<Option<CodexRemoteDaemonAction>, String> {
-    // 集成测试的库不是 cfg(test)，不能让临时 HOME 触发真实用户的 daemon。
-    if std::env::var_os("CC_SWITCH_TEST_HOME").is_some() {
-        return Ok(None);
-    }
-    if !active_proxy_uses_chatgpt_auth() {
-        return Ok(None);
-    }
-
-    tauri::async_runtime::spawn_blocking(
-        || ensure_with_candidates(codex_remote_daemon_candidates()),
-    )
-    .await
-    .map_err(|error| format!("等待 Codex Remote daemon 启动失败: {error}"))?
-    .map(Some)
-}
-
-#[cfg(test)]
-pub async fn ensure_for_active_proxy() -> Result<Option<CodexRemoteDaemonAction>, String> {
-    Ok(None)
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::TempDir;
-
-    fn fake_codex(dir: &TempDir, name: &str, body: &str) -> PathBuf {
-        let path = dir.path().join(name);
-        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake codex");
-        let mut permissions = fs::metadata(&path).expect("stat fake codex").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod fake codex");
-        path
-    }
-
-    #[test]
-    #[serial]
-    fn running_daemon_only_enables_remote_control() {
-        let dir = TempDir::new().expect("temp dir");
-        let calls = dir.path().join("calls.log");
-        let candidate = fake_codex(
-            &dir,
-            "codex",
-            &format!(
-                r#"printf '%s\n' "$*" >> '{}'
-if [ "$*" = "app-server daemon version" ]; then
-  printf '%s\n' '{{"status":"running"}}'
-  exit 0
-fi
-if [ "$*" = "remote-control start --json" ]; then
-  printf '%s\n' '{{"status":"connected"}}'
-  exit 0
-fi
-exit 1"#,
-                calls.display()
-            ),
-        );
-
-        assert_eq!(
-            ensure_with_candidates([candidate]),
-            Ok(CodexRemoteDaemonAction::AlreadyRunning)
-        );
-        assert_eq!(
-            fs::read_to_string(calls).expect("read calls"),
-            "app-server daemon version\nremote-control start --json\n"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn stopped_daemon_is_bootstrapped_with_remote_control() {
-        let dir = TempDir::new().expect("temp dir");
-        let calls = dir.path().join("calls.log");
-        let candidate = fake_codex(
-            &dir,
-            "codex",
-            &format!(
-                r#"printf '%s\n' "$*" >> '{}'
-if [ "$*" = "app-server daemon version" ]; then
-  printf '%s\n' '{{"status":"stopped"}}'
-  exit 0
-fi
-if [ "$*" = "app-server daemon bootstrap --remote-control" ]; then
-  exit 0
-fi
-if [ "$*" = "remote-control start --json" ]; then
-  printf '%s\n' '{{"status":"connected"}}'
-  exit 0
-fi
-exit 1"#,
-                calls.display()
-            ),
-        );
-
-        assert_eq!(
-            ensure_with_candidates([candidate]),
-            Ok(CodexRemoteDaemonAction::Bootstrapped)
-        );
-        assert_eq!(
-            fs::read_to_string(calls).expect("read calls"),
-            "app-server daemon version\napp-server daemon bootstrap --remote-control\nremote-control start --json\n"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn unsupported_cli_falls_back_to_daemon_capable_candidate() {
-        let dir = TempDir::new().expect("temp dir");
-        let unsupported = fake_codex(&dir, "old-codex", "exit 2");
-        let supported = fake_codex(
-            &dir,
-            "new-codex",
-            r#"if [ "$*" = "app-server daemon version" ]; then
-  printf '%s\n' '{"status":"running"}'
-  exit 0
-fi
-if [ "$*" = "remote-control start --json" ]; then
-  printf '%s\n' '{"status":"connected"}'
-  exit 0
-fi
-exit 1"#,
-        );
-
-        assert_eq!(
-            ensure_with_candidates([unsupported, supported]),
-            Ok(CodexRemoteDaemonAction::AlreadyRunning)
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn enabled_but_disconnected_remote_control_is_not_reported_as_success() {
-        let dir = TempDir::new().expect("temp dir");
-        let candidate = fake_codex(
-            &dir,
-            "codex",
-            r#"if [ "$*" = "app-server daemon version" ]; then
-  printf '%s\n' '{"status":"running"}'
-  exit 0
-fi
-if [ "$*" = "remote-control start --json" ]; then
-  printf '%s\n' '{"status":"errored"}'
-  exit 1
-fi
-exit 1"#,
-        );
-
-        let error = ensure_with_candidates([candidate]).expect_err("remote should be errored");
-        assert!(error.contains("remote-control start"));
-        assert!(error.contains("errored"));
-    }
 }

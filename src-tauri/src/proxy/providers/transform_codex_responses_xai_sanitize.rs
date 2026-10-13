@@ -16,14 +16,15 @@
 //! return-path whole-float tool argument rewrites are separate
 //! entry points so they cannot be mistaken for "just delete a field". Gated on
 //! [`super::codex::provider_needs_responses_namespace_flatten`], which covers
-//! xAI OAuth *and* API-key cards whose live upstream is `api.x.ai` Responses.
+//! xAI OAuth, API-key cards whose live upstream is `api.x.ai` Responses, and
+//! Copilot requests whose resolved outbound model is Grok.
 //!
 //! Run request sanitizers *after* namespace flattening: by then Codex's
 //! `namespace` tools are already lifted to top-level `function` tools, so the
 //! tool-type whitelist below keeps them instead of dropping them.
 //!
 //! Isolation for upstream rebases: keep every xAI-only rewrite in this file.
-//! `forwarder` should call [`apply_xai_native_responses_request_compat`] once;
+//! `forwarder` should call [`prepare_xai_native_responses_request`] once;
 //! `handlers` should only wrap SSE/non-stream restore. The live gate is
 //! [`super::codex::provider_needs_responses_namespace_flatten`]. If upstream
 //! later lands equivalent sanitization, delete this layer rather than
@@ -36,6 +37,8 @@ use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Number, Value};
 
 use super::transform_codex_responses_namespace::{restore_sse_event_namespaces, NamespacedName};
+use crate::provider::Provider;
+use crate::proxy::error::ProxyError;
 use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 
 /// Codex plugin-private fields removed recursively at any nesting depth.
@@ -631,11 +634,46 @@ fn normalize_xai_function_tool_parameter_schemas(body: &mut Value) -> bool {
     changed
 }
 
-/// One request-side entry point for the xAI native Responses gate.
-///
-/// `forwarder` stays a thin `if provider_needs_responses_namespace_flatten`
-/// call so `git rebase upstream/main` conflicts here or at that single site,
-/// not across inlined sanitizers. Logging stays here for the same reason.
+/// Shared request preparation for direct xAI and Copilot-hosted Grok Responses.
+/// Called only after the forwarder has selected the native Responses transport.
+pub(crate) fn prepare_xai_native_responses_request(
+    body: &mut Value,
+    provider: &Provider,
+    upstream_model: Option<&str>,
+) -> Result<(), ProxyError> {
+    if !super::codex::provider_needs_responses_namespace_flatten(
+        provider,
+        body.get("model").and_then(Value::as_str),
+    ) {
+        return Ok(());
+    }
+    super::transform_codex_responses_namespace::flatten_request_namespaces(body)?;
+
+    let is_copilot = provider.is_github_copilot();
+    apply_xai_native_responses_request_compat(
+        body,
+        &provider.id,
+        // Copilot's live model list has already resolved the exact model.
+        upstream_model.filter(|_| !is_copilot),
+        &provider.settings_config,
+    );
+    if is_copilot {
+        // Copilot rejects deferred function declarations for Grok. With
+        // tool_search removed by the sanitizer, these tools must be eager.
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                if tool.get("type").and_then(Value::as_str) == Some("function") {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("defer_loading");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply xAI rewrites after namespace flattening and provider/model gating.
 pub(crate) fn apply_xai_native_responses_request_compat(
     body: &mut Value,
     provider_id: &str,
@@ -1153,6 +1191,93 @@ fn rewrite_xai_native_sse_block(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn copilot_provider() -> Provider {
+        let mut provider = Provider::with_id(
+            "copilot".into(),
+            "Copilot".into(),
+            json!({"config": "model = \"gpt-6-astra\""}),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("github_copilot".into()),
+            ..Default::default()
+        });
+        provider
+    }
+
+    fn copilot_grok_request() -> Value {
+        json!({
+            "model": "grok-4.7",
+            "input": [
+                {"type":"function_call", "call_id":"call-1", "namespace":"functions", "name":"lookup", "arguments":"{}"},
+                {"type":"function_call_output", "call_id":"call-1", "output":"OK"},
+                {"role":"user", "content":"Continue"}
+            ],
+            "tools": [
+                {"type":"namespace", "name":"functions", "tools":[
+                    {"type":"function", "name":"lookup", "defer_loading":true, "parameters":{
+                        "anyOf":[
+                            {"type":"object", "properties":{"defer_loading":{"type":"boolean"}}},
+                            {"type":"null"}
+                        ]
+                    }}
+                ]},
+                {"type":"web_search", "external_web_access":true},
+                {"type":"tool_search", "execution":"client"}
+            ],
+            "tool_choice":{"type":"function", "namespace":"functions", "name":"lookup"}
+        })
+    }
+
+    #[test]
+    fn copilot_grok_request_preparation_flattens_then_sanitizes_without_remapping() {
+        let provider = copilot_provider();
+        let mut body = copilot_grok_request();
+        let restore_map =
+            super::super::transform_codex_responses_namespace::namespace_restore_map(&body);
+        prepare_xai_native_responses_request(&mut body, &provider, Some("gpt-6-astra")).unwrap();
+        assert_eq!(body["model"], "grok-4.7");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert!(tool.get("defer_loading").is_none());
+        assert_eq!(tool["parameters"]["type"], "object");
+        assert_eq!(
+            tool["parameters"]["properties"]["defer_loading"]["type"],
+            "boolean"
+        );
+        assert!(tool["parameters"].get("anyOf").is_none());
+        assert_eq!(body["tools"][1], json!({"type":"web_search"}));
+        assert_eq!(body["input"][0]["name"], tool["name"]);
+        assert!(body["input"][0].get("namespace").is_none());
+        assert_eq!(body["tool_choice"]["name"], tool["name"]);
+        let restored = &restore_map[tool["name"].as_str().unwrap()];
+        assert_eq!(restored.namespace, "functions");
+        assert_eq!(restored.name, "lookup");
+
+        let once = body.clone();
+        prepare_xai_native_responses_request(&mut body, &provider, Some("gpt-6-astra")).unwrap();
+        assert_eq!(body, once);
+    }
+
+    #[test]
+    fn copilot_request_preparation_preserves_other_models_and_providers() {
+        for model in ["gpt-6-astra", "claude-opus-4.6", "my-grok-alias"] {
+            let mut body = copilot_grok_request();
+            body["model"] = json!(model);
+            let original = body.clone();
+            prepare_xai_native_responses_request(&mut body, &copilot_provider(), Some("grok-4.7"))
+                .unwrap();
+            assert_eq!(body, original);
+        }
+        let mut provider = copilot_provider();
+        provider.meta = None;
+        let mut body = copilot_grok_request();
+        let original = body.clone();
+        prepare_xai_native_responses_request(&mut body, &provider, None).unwrap();
+        assert_eq!(body, original);
+    }
     use std::collections::HashSet;
 
     #[test]
@@ -1698,6 +1823,71 @@ mod tests {
         let original = body.clone();
         assert!(!rewrite_xai_agent_message_input_items(&mut body));
         assert_eq!(body, original);
+    }
+
+    /// Opt-in smoke test through an already-running local Copilot proxy.
+    /// Does not start, stop, or change its configuration.
+    #[tokio::test]
+    #[ignore = "requires CC_SWITCH_COPILOT_SMOKE_URL and makes billed Grok requests"]
+    async fn copilot_grok_live_request_compat() {
+        let url = std::env::var("CC_SWITCH_COPILOT_SMOKE_URL").expect("local proxy URL");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        for streaming in [false, true] {
+            let mut body = copilot_grok_request();
+            body["input"] = json!("Call lookup with defer_loading set to false.");
+            body["stream"] = json!(streaming);
+            let restore_map =
+                super::super::transform_codex_responses_namespace::namespace_restore_map(&body);
+            prepare_xai_native_responses_request(&mut body, &copilot_provider(), None).unwrap();
+            let response = client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(90))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.bytes().await.unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let mut value: Value = if streaming {
+                let stream = create_xai_native_responses_sse_stream(
+                    futures::stream::iter([Ok::<_, std::io::Error>(bytes)]),
+                    restore_map.clone(),
+                );
+                let chunks: Vec<_> = stream.collect().await;
+                let text = chunks
+                    .into_iter()
+                    .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+                    .collect::<String>();
+                text.lines()
+                    .filter_map(|line| strip_sse_field(line, "data"))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find(|event| event["type"] == "response.completed")
+                    .expect("completed event")["response"]
+                    .clone()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            super::super::transform_codex_responses_namespace::restore_response_namespaces(
+                &mut value,
+                &restore_map,
+            );
+            let call = value["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call")
+                .expect("function call");
+            assert_eq!(call["name"], "lookup");
+            assert_eq!(call["namespace"], "functions");
+            let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args["defer_loading"], false);
+        }
     }
 
     #[test]

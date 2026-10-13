@@ -1120,7 +1120,10 @@ async fn handle_responses_for_app(
     // Native Responses passthrough to a strict gateway (xAI): restore flattened
     // function-call names *and* rewrite whole-float tool arguments. The integer
     // rewrite must run even when the request had no namespace tools.
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
+    if super::providers::provider_needs_responses_namespace_flatten(
+        &ctx.provider,
+        Some(ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model)),
+    ) {
         return handle_codex_xai_native_responses_rewrite(
             response,
             &ctx,
@@ -1435,7 +1438,10 @@ async fn handle_responses_compact_for_app(
         .await;
     }
 
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
+    if super::providers::provider_needs_responses_namespace_flatten(
+        &ctx.provider,
+        Some(ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model)),
+    ) {
         return handle_codex_xai_native_responses_rewrite(
             response,
             &ctx,
@@ -1511,7 +1517,7 @@ async fn handle_codex_late_arguments_repair(
         })
 }
 
-/// Response handler for the native Responses passthrough to xAI: restore
+/// Response handler for direct xAI and Copilot-hosted Grok Responses: restore
 /// flattened `function_call` names and rewrite whole-float tool arguments.
 /// Error bodies pass through unchanged. Usage is collected exactly as
 /// `process_response` would (same `CODEX_PARSER_CONFIG`).
@@ -1545,9 +1551,23 @@ async fn handle_codex_xai_native_responses_rewrite(
     if response.is_sse() {
         let builder = rewritten_sse_response_builder(status, response.headers());
 
+        // Keep Copilot identity and late-argument repairs before restoring
+        // names, just as on the generic native Responses path.
+        let stream = native_response_stream(response, ctx);
+        let stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+        > = if ctx.provider.is_github_copilot() {
+            Box::pin(
+                super::providers::responses_late_arguments::create_late_arguments_repair_stream(
+                    stream,
+                ),
+            )
+        } else {
+            stream
+        };
         let restore_stream =
             transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
-                response.bytes_stream(),
+                stream,
                 restore_map,
             );
         let usage_collector =
@@ -1644,6 +1664,7 @@ async fn handle_codex_xai_native_responses_rewrite(
     };
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    response_headers.remove(axum::http::header::ETAG);
     response_headers.remove(axum::http::header::CONTENT_TYPE);
 
     let mut builder = axum::response::Response::builder().status(status);
@@ -3297,7 +3318,7 @@ mod tests {
             )
             .await
             .unwrap();
-            for path in ["passthrough", "late_arguments", "compaction"] {
+            for path in ["passthrough", "late_arguments", "compaction", "grok"] {
                 let mut headers = axum::http::HeaderMap::new();
                 headers.insert("content-type", "text/event-stream".parse().unwrap());
                 headers.insert("content-length", sse.len().to_string().parse().unwrap());
@@ -3307,6 +3328,23 @@ mod tests {
                     Bytes::from(sse.clone()),
                 );
                 let response = match path {
+                    "grok" => {
+                        let restore_map = std::collections::HashMap::from([(
+                            "lookup".to_string(),
+                            super::transform_codex_responses_namespace::NamespacedName {
+                                namespace: "functions".into(),
+                                name: "lookup_original".into(),
+                            },
+                        )]);
+                        super::handle_codex_xai_native_responses_rewrite(
+                            upstream,
+                            &ctx,
+                            &state,
+                            None,
+                            restore_map,
+                        )
+                        .await
+                    }
                     "late_arguments" => {
                         super::handle_codex_late_arguments_repair(
                             upstream, &ctx, &state, true, None,
@@ -3374,6 +3412,10 @@ mod tests {
                             event["response"]["output"][1]["call_id"], "call-wire",
                             "{path}"
                         );
+                        if path == "grok" {
+                            assert_eq!(event["response"]["output"][1]["name"], "lookup_original");
+                            assert_eq!(event["response"]["output"][1]["namespace"], "functions");
+                        }
                         if path == "compaction" {
                             assert_eq!(event["response"]["output"][2]["type"], "compaction");
                             assert_eq!(
@@ -3382,7 +3424,7 @@ mod tests {
                             );
                         }
                     }
-                    if path == "late_arguments" && event["output_index"] == 1 {
+                    if matches!(path, "late_arguments" | "grok") && event["output_index"] == 1 {
                         let arguments = match event["type"].as_str() {
                             Some("response.function_call_arguments.done") => event.get("arguments"),
                             Some("response.output_item.done") => event.pointer("/item/arguments"),
@@ -3399,11 +3441,94 @@ mod tests {
                 }
                 assert_eq!(text, "DIAG_OK", "{path}");
                 assert_eq!(completed, 1, "{path}");
-                if path == "late_arguments" {
+                if matches!(path, "late_arguments" | "grok") {
                     assert_eq!(repaired_arguments, 2);
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn copilot_grok_nonstream_handler_restores_tools_and_entity_headers() {
+        use crate::{
+            app_config::AppType,
+            database::Database,
+            mode::stack::StackTarget,
+            provider::{Provider, ProviderMeta},
+            proxy::{
+                handler_context::RequestContext, hyper_client::ProxyResponse, server::ProxyState,
+            },
+        };
+        use http_body_util::BodyExt;
+        use serde_json::{json, Value};
+
+        let state = ProxyState::for_test(Arc::new(Database::memory().unwrap()));
+        state.config.write().await.enable_logging = false;
+        let mut provider = Provider::with_id("copilot".into(), "Copilot".into(), json!({}), None);
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".into()),
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(
+            &state,
+            &json!({"model":"my-alias"}),
+            &axum::http::HeaderMap::new(),
+            AppType::Codex,
+            "test",
+            "codex",
+            Some(StackTarget {
+                provider,
+                upstream_model: "grok-4.7".into(),
+                original_model: "my-alias".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        ctx.outbound_model = Some("grok-4.7".into());
+        assert!(
+            crate::proxy::providers::provider_needs_responses_namespace_flatten(
+                &ctx.provider,
+                ctx.outbound_model.as_deref(),
+            )
+        );
+        let fixture = json!({
+            "id":"response-id", "status":"completed", "model":"grok-4.7",
+            "output":[{"type":"function_call", "id":"item-id", "call_id":"call-id",
+                "name":"functions__lookup", "arguments":"{\"key\":7.0}"}]
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("content-length", fixture.len().to_string().parse().unwrap());
+        headers.insert("etag", "\"original\"".parse().unwrap());
+        let upstream =
+            ProxyResponse::buffered(axum::http::StatusCode::OK, headers, Bytes::from(fixture));
+        let restore_map = std::collections::HashMap::from([(
+            "functions__lookup".into(),
+            super::transform_codex_responses_namespace::NamespacedName {
+                namespace: "functions".into(),
+                name: "lookup".into(),
+            },
+        )]);
+        let response = super::handle_codex_xai_native_responses_rewrite(
+            upstream,
+            &ctx,
+            &state,
+            None,
+            restore_map,
+        )
+        .await
+        .unwrap();
+        assert!(!response.headers().contains_key("content-length"));
+        assert!(!response.headers().contains_key("etag"));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["id"], "response-id");
+        assert_eq!(body["output"][0]["id"], "item-id");
+        assert_eq!(body["output"][0]["call_id"], "call-id");
+        assert_eq!(body["output"][0]["name"], "lookup");
+        assert_eq!(body["output"][0]["namespace"], "functions");
+        assert_eq!(body["output"][0]["arguments"], "{\"key\":7}");
     }
 
     /// 补发了压缩条目的 SSE 比上游声明的长：留着上游的 Content-Length，客户端读到那个

@@ -2102,35 +2102,23 @@ impl RequestForwarder {
             }
         }
 
-        // Native Responses passthrough to a strict third-party gateway (xAI).
-        // One gate so rebase conflicts stay here plus the isolate file, not
-        // scattered across sanitizers. Flatten namespaces first; then apply
-        // xAI request rewrites (schema, agent_message, unknown models).
+        // Direct xAI and Copilot-hosted Grok share strict Responses schemas.
+        // The helper gates on the resolved model and flattens namespaces first.
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
-            && super::providers::provider_needs_responses_namespace_flatten(provider)
         {
-            if super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
-                &mut request_body,
-            )? {
-                log::debug!(
-                    "[Codex] Flattened namespace tools for native Responses upstream (provider={})",
-                    provider.id
-                );
-            }
             // Stack 请求只做字段兼容。
             let upstream_model = if self.keeps_resolved_model() {
                 None
             } else {
                 super::providers::codex_provider_upstream_model(provider)
             };
-            super::providers::transform_codex_responses_xai_sanitize::apply_xai_native_responses_request_compat(
+            super::providers::transform_codex_responses_xai_sanitize::prepare_xai_native_responses_request(
                 &mut request_body,
-                &provider.id,
+                provider,
                 upstream_model.as_deref(),
-                &provider.settings_config,
-            );
+            )?;
         }
 
         // Stack 请求发往拒收托管 `web_search` 的原生 Responses 上游：去掉这个工具，和 Chat、

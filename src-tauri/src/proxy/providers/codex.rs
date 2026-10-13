@@ -220,10 +220,15 @@ pub fn should_convert_codex_responses_to_anthropic(provider: &Provider, endpoint
 /// Chat/Anthropic transform paths already unwrap namespaces, so this only
 /// fires on native Responses passthrough.
 ///
-/// Covers managed xAI OAuth *and* API-key providers whose live upstream is
-/// `api.x.ai` with `wire_api = "responses"`. See farion1231/cc-switch#6815.
-pub fn provider_needs_responses_namespace_flatten(provider: &Provider) -> bool {
-    provider.is_xai_oauth() || provider_is_xai_native_responses(provider)
+/// Covers direct xAI providers and Grok served through Copilot. Use the resolved
+/// outbound model, not a provider's default or a client-side model alias.
+pub fn provider_needs_responses_namespace_flatten(
+    provider: &Provider,
+    model: Option<&str>,
+) -> bool {
+    provider.is_xai_oauth()
+        || provider_is_xai_native_responses(provider)
+        || (provider.is_github_copilot() && model.is_some_and(|model| model.starts_with("grok-")))
 }
 
 /// True when this Codex provider talks native Responses to first-party xAI
@@ -2534,7 +2539,7 @@ wire_api = "responses"
             provider_type: Some("xai_oauth".to_string()),
             ..Default::default()
         });
-        assert!(provider_needs_responses_namespace_flatten(&xai));
+        assert!(provider_needs_responses_namespace_flatten(&xai, None));
 
         // API-key Grok cards (no xai_oauth meta) still talk to api.x.ai Responses.
         let grok_key = create_provider(json!({
@@ -2549,7 +2554,7 @@ base_url = "https://api.x.ai/v1"
 wire_api = "responses"
 "#
         }));
-        assert!(provider_needs_responses_namespace_flatten(&grok_key));
+        assert!(provider_needs_responses_namespace_flatten(&grok_key, None));
 
         // A non-xAI Responses provider must not be flattened.
         let other = create_provider(json!({
@@ -2560,6 +2565,32 @@ base_url = "https://api.deepseek.com"
 wire_api = "responses"
 "#
         }));
-        assert!(!provider_needs_responses_namespace_flatten(&other));
+        assert!(!provider_needs_responses_namespace_flatten(
+            &other,
+            Some("grok-4.7")
+        ));
+    }
+
+    #[test]
+    fn namespace_flatten_gate_uses_copilot_outbound_model_only() {
+        let mut copilot = create_provider(json!({"config": "model = \"grok-4.7\""}));
+        copilot.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("github_copilot".into()),
+            ..Default::default()
+        });
+        for model in ["grok-4.5", "grok-4.7", "grok-4.7-build"] {
+            assert!(provider_needs_responses_namespace_flatten(
+                &copilot,
+                Some(model)
+            ));
+        }
+        for model in [
+            None,
+            Some("gpt-6-astra"),
+            Some("claude-opus-4.6"),
+            Some("my-grok-alias"),
+        ] {
+            assert!(!provider_needs_responses_namespace_flatten(&copilot, model));
+        }
     }
 }

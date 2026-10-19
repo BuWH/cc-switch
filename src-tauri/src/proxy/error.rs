@@ -273,7 +273,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let error = reqwest::Client::new()
+        // This fixture needs a local connection error, not a system proxy response.
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build direct test client")
             .get(format!(
                 "http://127.0.0.1:{port}/v1/responses?key=secret-token"
             ))

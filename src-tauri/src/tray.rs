@@ -55,6 +55,9 @@ fn app_display_name(app: &AppType) -> &'static str {
         AppType::Hermes => "Hermes",
         AppType::Pi => "Pi",
         AppType::Mcode => "MiniMax Code",
+        AppType::Kimi => "Kimi Code",
+        AppType::Agy => "Antigravity",
+        AppType::Omp => "Oh My Pi",
     }
 }
 
@@ -129,7 +132,6 @@ pub struct TrayTexts {
     pub tier_used: &'static str,
     pub tier_used_up: &'static str,
     pub balance: &'static str,
-    pub balance_used_up: &'static str,
     pub plan_expired: &'static str,
     pub used_amount: &'static str,
     pub quota_failed: &'static str,
@@ -230,7 +232,6 @@ impl TrayTexts {
                 tier_used: "{label} {value}% used",
                 tier_used_up: "{label} used up",
                 balance: "Balance {value}",
-                balance_used_up: "Balance used up",
                 plan_expired: "Plan expired",
                 used_amount: "Used {value}",
                 quota_failed: "Quota unavailable",
@@ -288,7 +289,6 @@ impl TrayTexts {
                 texts.tier_used = "{label} %{value} kullanıldı";
                 texts.tier_used_up = "{label} tükendi";
                 texts.balance = "Bakiye {value}";
-                texts.balance_used_up = "Bakiye tükendi";
                 texts.plan_expired = "Planın süresi doldu";
                 texts.used_amount = "Kullanılan: {value}";
                 texts.quota_failed = "Kota bilgisi alınamıyor";
@@ -345,7 +345,6 @@ impl TrayTexts {
                 tier_used: "{label} 使用済み {value}%",
                 tier_used_up: "{label} 使い切り",
                 balance: "残高 {value}",
-                balance_used_up: "残高なし",
                 plan_expired: "プラン期限切れ",
                 used_amount: "使用 {value}",
                 quota_failed: "残量を取得できません",
@@ -400,12 +399,11 @@ impl TrayTexts {
                 tier_used: "{labelSp}已用 {value}%",
                 tier_used_up: "{labelSp}已用完",
                 balance: "餘額 {value}",
-                balance_used_up: "餘額已用完",
                 plan_expired: "方案已過期",
                 used_amount: "已使用 {value}",
-                quota_failed: "額度沒查到",
-                quota_failed_login_expired: "額度沒查到：登入已過期",
-                quota_failed_token_refresh_pending: "額度沒查到：權杖待重新整理",
+                quota_failed: "額度查詢失敗",
+                quota_failed_login_expired: "額度查詢失敗：登入已過期",
+                quota_failed_token_refresh_pending: "額度查詢失敗：權杖待重新整理",
                 reset_on_date: "{labelSp}額度 {when}重置",
                 reset_at_time: "{labelSp}額度 {when} 重置",
                 date_format: "%-m 月 %-d 日",
@@ -455,12 +453,11 @@ impl TrayTexts {
                 tier_used: "{labelSp}已用 {value}%",
                 tier_used_up: "{labelSp}已用完",
                 balance: "余额 {value}",
-                balance_used_up: "余额已用完",
                 plan_expired: "套餐已过期",
                 used_amount: "已使用 {value}",
-                quota_failed: "额度没查到",
-                quota_failed_login_expired: "额度没查到：登录已过期",
-                quota_failed_token_refresh_pending: "额度没查到：令牌待刷新",
+                quota_failed: "额度查询失败",
+                quota_failed_login_expired: "额度查询失败：登录已过期",
+                quota_failed_token_refresh_pending: "额度查询失败：令牌待刷新",
                 reset_on_date: "{labelSp}额度 {when}重置",
                 reset_at_time: "{labelSp}额度 {when} 重置",
                 date_format: "%-m 月 %-d 日",
@@ -586,6 +583,8 @@ struct QuotaLine {
     /// 档名（重置说明用；余额等没有档名）。
     label: Option<&'static str>,
     resets_at: Option<String>,
+    /// 要上色的那段数值（还有余额时的金额，照卡片 `balanceLine` 的 `emphasis`）；其余为空。
+    emphasis: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,6 +629,7 @@ fn tier_line(
         left,
         label: Some(label),
         resets_at,
+        emphasis: None,
     }
 }
 
@@ -713,6 +713,9 @@ fn resets_at_from_extra(extra: Option<&str>) -> Option<String> {
 }
 
 fn amount(value: f64, unit: Option<&str>) -> String {
+    // `{:.2}` 会把 -0.0 和舍入到 0 的小负数写成 -0.00（DeepSeek 欠费归零时就回 "-0.00"）
+    let rounded = (value * 100.0).round() / 100.0;
+    let value = if rounded == 0.0 { 0.0 } else { value };
     match unit.map(str::trim).filter(|unit| !unit.is_empty()) {
         Some(unit) => format!("{value:.2} {unit}"),
         None => format!("{value:.2}"),
@@ -727,6 +730,7 @@ fn plan_line(texts: &TrayTexts, data: &crate::provider::UsageData) -> Option<Quo
             left: -1.0,
             label: None,
             resets_at: None,
+            emphasis: None,
         });
     }
     let unit = data.unit.as_deref();
@@ -740,18 +744,18 @@ fn plan_line(texts: &TrayTexts, data: &crate::provider::UsageData) -> Option<Quo
         }
     }
     if let Some(remaining) = data.remaining {
-        // 余额不提示「快用完」，只有用完才算（和卡片 `quotaRules.balanceLine` 一致）
+        // 余额不提示「快用完」，只有用完才算（和卡片 `quotaRules.balanceLine` 一致）；
+        // 用完也照写金额（欠费就是负数，#8812），整行变色、金额不另上绿色
         let left = if remaining <= 0.0 { 0.0 } else { f64::INFINITY };
-        let text = if remaining <= 0.0 {
-            texts.balance_used_up.to_string()
-        } else {
-            fill(texts.balance, &[("value", &amount(remaining, unit))])
-        };
+        let value = amount(remaining, unit);
+        let text = fill(texts.balance, &[("value", &value)]);
+        let emphasis = (remaining > 0.0).then_some(value);
         return Some(QuotaLine {
             text,
             left,
             label: None,
             resets_at: None,
+            emphasis,
         });
     }
     data.used.map(|used| QuotaLine {
@@ -759,6 +763,7 @@ fn plan_line(texts: &TrayTexts, data: &crate::provider::UsageData) -> Option<Quo
         left: f64::INFINITY,
         label: None,
         resets_at: None,
+        emphasis: None,
     })
 }
 
@@ -2056,6 +2061,8 @@ pub struct PanelApp {
     pub current: Option<String>,
     /// 直连 / 路由 / 聚合。
     pub mode: &'static str,
+    /// 同一模式的机器可读值（`direct` / `route` / `stack`），面板按它给模式名上主题色。
+    pub mode_kind: &'static str,
     /// 子面板标题下的说明（「路由 · 故障转移开启中」等）。
     pub header: Option<String>,
     pub attention: Option<&'static str>,
@@ -2086,6 +2093,8 @@ pub struct PanelQuotaLine {
     pub warn: bool,
     /// 这一档什么时候重置（ISO 8601），前端按本地时间写。
     pub resets_at: Option<String>,
+    /// `text` 里要上绿色的那段数值（还有余额时的金额）；其余为空。
+    pub emphasis: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2125,6 +2134,7 @@ fn panel_quota(
                     left: line.left.is_finite().then(|| line.left.clamp(0.0, 100.0)),
                     warn: line.left < WARN_BELOW_PERCENT,
                     resets_at: line.resets_at.clone(),
+                    emphasis: line.emphasis.clone(),
                 })
                 .collect(),
             note: None,
@@ -2279,6 +2289,11 @@ pub(crate) fn collect_panel_model(app_state: &AppState) -> Result<PanelModel, Ap
                 TrayMode::Direct => texts.header_direct,
                 TrayMode::Route | TrayMode::Failover => texts.mode_route,
                 TrayMode::Stack => texts.mode_stack,
+            },
+            mode_kind: match snapshot.mode {
+                TrayMode::Direct => "direct",
+                TrayMode::Route | TrayMode::Failover => "route",
+                TrayMode::Stack => "stack",
             },
             header,
             attention: snapshot.needs_attention.then_some(texts.needs_attention),
@@ -2555,6 +2570,10 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
     #[cfg(not(target_os = "linux"))]
     {
         crate::tray_panel::notify_changed(app);
+        // 出面板时托盘上没挂原生菜单，没有标题要改
+        if !crate::tray_panel::uses_native_menu() {
+            return;
+        }
         let Some(app_state) = app.try_state::<AppState>() else {
             return;
         };
@@ -2580,7 +2599,7 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
 
 pub fn refresh_tray_menu(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        if crate::tray_panel::USES_NATIVE_MENU {
+        if crate::tray_panel::uses_native_menu() {
             match create_tray_menu(app, state.inner()) {
                 Ok(new_menu) => {
                     if let Some(tray) = app.tray_by_id(TRAY_ID) {
@@ -2596,6 +2615,32 @@ pub fn refresh_tray_menu(app: &tauri::AppHandle) {
         }
     }
     crate::tray_panel::notify_changed(app);
+}
+
+/// 设置里切换了原生托盘菜单 / 托盘面板：当场换掉托盘的点击行为，不用重启。
+/// 换成原生菜单时挂上重建的菜单、收起面板；换成面板时摘掉菜单（`refresh_tray_menu` 只更新图标状态）。
+pub fn apply_tray_style(app: &tauri::AppHandle) {
+    let native = crate::tray_panel::uses_native_menu();
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if native {
+            crate::tray_panel::hide_panel(app);
+        } else {
+            if let Err(e) = tray.set_menu(None::<Menu<tauri::Wry>>) {
+                log::error!("摘掉托盘菜单失败: {e}");
+            }
+            // 菜单没了，旧句柄不再更新标题。
+            lock(&TRAY_SECTION_SUBMENUS).clear();
+        }
+        if let Err(e) = tray.set_show_menu_on_left_click(native_menu_on_left_click(native)) {
+            log::warn!("设置托盘左键行为失败: {e}");
+        }
+    }
+    refresh_tray_menu(app);
+}
+
+/// 左键是否直接出原生菜单：用面板时不出；Windows 的习惯是左键打开主界面、右键出菜单。
+pub fn native_menu_on_left_click(native: bool) -> bool {
+    native && cfg!(not(target_os = "windows"))
 }
 
 /// 悬停到托盘图标时：问题区该出现 / 该消失了（路由服务停了、又起来了）、反馈行显示过了或到点了，
@@ -3618,8 +3663,29 @@ mod tests {
         );
         assert_eq!(
             one(balance(0.0, Some(100.0))),
-            Some(("余额已用完".to_string(), false))
+            Some(("余额 0.00 CNY".to_string(), false))
         );
+        // 欠费照写负数；-0.0 和舍入到 0 的小负数不写成 -0.00（#8812）
+        assert_eq!(
+            one(balance(-24.96, None)),
+            Some(("余额 -24.96 CNY".to_string(), false))
+        );
+        assert_eq!(
+            one(balance(-0.0, None)),
+            Some(("余额 0.00 CNY".to_string(), false))
+        );
+        assert_eq!(
+            one(balance(-0.004, None)),
+            Some(("余额 0.00 CNY".to_string(), false))
+        );
+
+        // 面板只给还有的余额金额上绿色；用完的那行整行变色，金额不另上色
+        let emphasis = |data| match format_script_result(&zh(), &usage_result(true, vec![data])) {
+            Some(QuotaView::Lines(lines)) => lines[0].emphasis.clone(),
+            _ => panic!("expected quota lines"),
+        };
+        assert_eq!(emphasis(balance(82.1, None)), Some("82.10 CNY".to_string()));
+        assert_eq!(emphasis(balance(0.0, Some(100.0))), None);
     }
 
     #[test]
@@ -3658,7 +3724,7 @@ mod tests {
         assert_eq!(title(failed.clone()), None);
         assert_eq!(
             quota_note(&zh(), &failed.unwrap(), now()).as_deref(),
-            Some("额度没查到")
+            Some("额度查询失败")
         );
 
         let login =
@@ -3666,7 +3732,7 @@ mod tests {
         let view = format_subscription_quota(&zh(), &login).unwrap();
         assert_eq!(
             quota_note(&zh(), &view, now()).as_deref(),
-            Some("额度没查到：登录已过期")
+            Some("额度查询失败：登录已过期")
         );
         let pending = SubscriptionQuota::error(
             "claude",
@@ -3676,7 +3742,7 @@ mod tests {
         let view = format_subscription_quota(&zh(), &pending).unwrap();
         assert_eq!(
             quota_note(&zh(), &view, now()).as_deref(),
-            Some("额度没查到：令牌待刷新")
+            Some("额度查询失败：令牌待刷新")
         );
         // 没有凭据时不说话。
         let missing =

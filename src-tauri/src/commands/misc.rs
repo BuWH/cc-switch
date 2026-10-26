@@ -10203,9 +10203,14 @@ mod tests {
         // omp is reported as not installed and updates lose their anchor.
         let home = dirs::home_dir().expect("home should resolve");
         let bun_bin = home.join(".bun").join("bin");
-        assert!(build_tool_search_paths("omp").contains(&bun_bin));
-        // Other Bun-installable tools keep their previous search set.
-        assert!(!build_tool_search_paths("gemini").contains(&bun_bin));
+        assert_eq!(build_tool_search_paths("omp").first(), Some(&bun_bin));
+        // Other tools may already inherit Bun from PATH, but must not add it.
+        let mut inherited = IndexSet::new();
+        extend_from_cli_path_env(&mut inherited, effective_path_os());
+        assert_eq!(
+            build_tool_search_paths("gemini").contains(&bun_bin),
+            inherited.contains(&bun_bin)
+        );
     }
 
     #[cfg(target_os = "windows")]

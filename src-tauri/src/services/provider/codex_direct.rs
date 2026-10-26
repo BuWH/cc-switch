@@ -1217,10 +1217,11 @@ pub(crate) fn run_with_edits(
         }
     };
     let mut config = planned.config;
+    // Entering or reattaching the proxy can restore a stashed ChatGPT login.
     let native_proxy_auth = matches!(planned.auth, AuthGoal::KeepNative)
         && planned.stamp == Some(RouteAuth::Bearer)
         && codex_config_auth_store_mode(&config_text) == CodexAuthStoreMode::File
-        && live_auth
+        && file_after(&auth_plan, live_auth.as_ref())
             .as_ref()
             .is_some_and(crate::codex_config::codex_auth_has_chatgpt_login_material);
     if let (Some(kind), RouteWrite::Custom(table)) = (planned.stamp, &mut config.route) {

@@ -4082,6 +4082,16 @@ model_provider = "c"
 
         enter(&state, &AppType::Codex, false).await.expect("enter");
         assert_eq!(codex_login_file(), Some(chatgpt_login("acct")));
+        assert!(
+            codex_doc()["model_providers"]["custom"]
+                .get("experimental_bearer_token")
+                .is_none(),
+            "restored ChatGPT login must reach the local proxy without a placeholder"
+        );
+        assert_eq!(
+            codex_doc()["features"]["remote_control"].as_bool(),
+            Some(true)
+        );
         assert_eq!(
             codex_doc()["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
             Some(true)
@@ -4093,6 +4103,10 @@ model_provider = "c"
             .await
             .expect("route b");
         assert_eq!(codex_login_file(), None);
+        assert_eq!(
+            codex_doc()["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some(PROXY_TOKEN_PLACEHOLDER)
+        );
         exit(&state, &AppType::Codex).await.expect("exit");
     }
 

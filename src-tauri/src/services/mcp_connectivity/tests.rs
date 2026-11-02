@@ -338,7 +338,8 @@ async fn cancellation_and_timeout_release_stdio_descendants() {
 async fn stdio_login_path_finds_bare_launchers_and_configured_path_wins() {
     let dir = tempfile::tempdir().unwrap();
     let launcher = dir.path().join("mcp-path-fixture");
-    std::fs::copy("/usr/bin/env", &launcher).unwrap();
+    // macOS can kill copied platform binaries; keep the signed system tool in place.
+    std::os::unix::fs::symlink("/usr/bin/env", &launcher).unwrap();
     let login_path = format!("{}:/usr/bin:/bin", dir.path().display());
     for configured_path in [None, Some("/explicit/server/bin:/usr/bin")] {
         let mut command = Command::new("mcp-path-fixture");

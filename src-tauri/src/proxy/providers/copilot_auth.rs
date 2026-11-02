@@ -1170,6 +1170,28 @@ impl CopilotAuthManager {
         Ok(super::copilot_model_map::resolve_model(model_id, &models).map(|model| model.vendor))
     }
 
+    /// Vendor and upstream endpoints Copilot advertises for `model_id`.
+    pub async fn get_model_record_for_account(
+        &self,
+        account_id: &str,
+        model_id: &str,
+    ) -> Result<Option<CopilotModel>, CopilotAuthError> {
+        let models = self
+            .load_models_for_account(account_id, Some(model_id), false)
+            .await?;
+        Ok(super::copilot_model_map::resolve_model_record(model_id, &models).cloned())
+    }
+
+    pub async fn get_model_record(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<CopilotModel>, CopilotAuthError> {
+        match self.resolve_default_account_id().await {
+            Some(id) => self.get_model_record_for_account(&id, model_id).await,
+            None => Err(CopilotAuthError::GitHubTokenInvalid),
+        }
+    }
+
     pub async fn resolve_model_for_account(
         &self,
         account_id: &str,
@@ -2767,6 +2789,14 @@ mod tests {
         assert!(models
             .iter()
             .any(|model| model.id == "gpt-hidden" && model.uses_responses_api()));
+        let record = mock
+            .manager
+            .get_model_record("gpt-hidden")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.id, "gpt-hidden");
+        assert_eq!(record.supported_endpoints, vec!["/responses"]);
         assert_eq!(mock.request_count(), 1);
     }
 

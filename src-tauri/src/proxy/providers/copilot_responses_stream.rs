@@ -20,12 +20,22 @@ struct ResponseIds {
 }
 
 impl ResponseIds {
+    #[cfg(test)]
     fn normalize(&mut self, event: &mut Value) -> bool {
-        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-            return false;
-        };
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.normalize_kind(&event_type, event)
+    }
+
+    fn normalize_kind(&mut self, event_type: &str, event: &mut Value) -> bool {
         if !event_type.starts_with("response.") {
             return false;
+        }
+        if event_type == "response.created" {
+            *self = Self::default();
         }
 
         let mut changed = false;
@@ -71,7 +81,13 @@ impl ResponseIds {
         let Ok(mut event) = serde_json::from_str::<Value>(&data) else {
             return frame;
         };
-        if !self.normalize(&mut event) {
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| text.lines().find_map(|line| strip_sse_field(line, "event")))
+            .unwrap_or_default()
+            .to_owned();
+        if !self.normalize_kind(&kind, &mut event) {
             return frame;
         }
 
@@ -339,6 +355,24 @@ data: {\"type\":\"response.output_item.done\",\"output_index\":7,\"item\":{\"id\
         let output = normalize(vec![input]).await;
         assert!(!output.ends_with(b"\n"));
         assert_eq!(parse_events(&output)[1]["item"]["id"], "first-delta");
+    }
+
+    #[tokio::test]
+    async fn copilot_event_header_fallback_and_new_response_reset_ids() {
+        let input = Bytes::from_static(
+            b"event: response.created\ndata: {\"response\":{\"id\":\"response-a\",\"output\":[]}}\n\n\
+event: response.output_text.delta\ndata: {\"output_index\":0,\"item_id\":\"first-a\",\"delta\":\"a\"}\n\n\
+event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"id\":\"done-a\"}}\n\n\
+event: response.created\ndata: {\"response\":{\"id\":\"response-b\",\"output\":[]}}\n\n\
+event: response.output_text.delta\ndata: {\"output_index\":0,\"item_id\":\"first-b\",\"delta\":\"b\"}\n\n\
+event: response.completed\ndata: {\"response\":{\"id\":\"done-b\",\"output\":[{\"id\":\"last-b\"}]}}\n\n",
+        );
+        let events = parse_events(&normalize(vec![input]).await);
+        assert_eq!(events[2]["item"]["id"], "first-a");
+        assert_eq!(events[3]["response"]["id"], "response-b");
+        assert_eq!(events[5]["response"]["id"], "response-b");
+        assert_eq!(events[5]["response"]["output"][0]["id"], "first-b");
+        assert!(events.iter().all(|event| event.get("type").is_none()));
     }
 
     #[test]

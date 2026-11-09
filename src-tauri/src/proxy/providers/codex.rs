@@ -220,15 +220,25 @@ pub fn should_convert_codex_responses_to_anthropic(provider: &Provider, endpoint
 /// Chat/Anthropic transform paths already unwrap namespaces, so this only
 /// fires on native Responses passthrough.
 ///
-/// Covers direct xAI providers and Grok served through Copilot. Use the resolved
-/// outbound model, not a provider's default or a client-side model alias.
+/// Covers managed xAI OAuth *and* API-key providers whose live upstream is
+/// `api.x.ai` with `wire_api = "responses"`, plus Grok models served by managed
+/// Copilot. Call only on native Responses paths, with the resolved outbound
+/// model: a Copilot card can serve both Grok and non-Grok models.
+/// See farion1231/cc-switch#6815.
 pub fn provider_needs_responses_namespace_flatten(
     provider: &Provider,
-    model: Option<&str>,
+    outbound_model: Option<&str>,
 ) -> bool {
     provider.is_xai_oauth()
         || provider_is_xai_native_responses(provider)
-        || (provider.is_github_copilot() && model.is_some_and(|model| model.starts_with("grok-")))
+        || (provider.is_github_copilot()
+            && outbound_model.is_some_and(|model| {
+                model
+                    .trim()
+                    .as_bytes()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"grok-"))
+            }))
 }
 
 /// True when this Codex provider talks native Responses to first-party xAI
@@ -2674,6 +2684,7 @@ base_url = "https://api.deepseek.com"
 wire_api = "responses"
 "#
         }));
+        assert!(!provider_needs_responses_namespace_flatten(&other, None));
         assert!(!provider_needs_responses_namespace_flatten(
             &other,
             Some("grok-4.7")
@@ -2681,25 +2692,36 @@ wire_api = "responses"
     }
 
     #[test]
-    fn namespace_flatten_gate_uses_copilot_outbound_model_only() {
-        let mut copilot = create_provider(json!({"config": "model = \"grok-4.7\""}));
-        copilot.meta = Some(crate::provider::ProviderMeta {
-            provider_type: Some("github_copilot".into()),
-            ..Default::default()
+    fn copilot_namespace_compat_uses_only_the_outbound_grok_model() {
+        let mut copilot = create_copilot_provider();
+        copilot.settings_config = json!({
+            "config": "model = \"grok-4.7\"",
+            "modelCatalog": {"models": [{"model": "grok-4.7"}, {"model": "gpt-6.1-sol"}]}
         });
-        for model in ["grok-4.5", "grok-4.7", "grok-4.7-build"] {
-            assert!(provider_needs_responses_namespace_flatten(
-                &copilot,
-                Some(model)
-            ));
-        }
-        for model in [
-            None,
-            Some("gpt-6-astra"),
-            Some("claude-opus-4.6"),
-            Some("my-grok-alias"),
+        for (model, expected) in [
+            (Some("grok-4.7"), true),
+            (Some("grok-4.5"), true),
+            (Some("grok-4.7-build"), true),
+            (Some(" GROK-4.7-fast "), true),
+            (Some("gpt-6.1-sol"), false),
+            (Some("claude-sonnet-4.6"), false),
+            (Some("grokker"), false),
+            (Some("my-grok-alias"), false),
+            (Some("模型"), false),
+            (Some(""), false),
+            (None, false),
         ] {
-            assert!(!provider_needs_responses_namespace_flatten(&copilot, model));
+            assert_eq!(
+                provider_needs_responses_namespace_flatten(&copilot, model),
+                expected,
+                "{model:?}"
+            );
         }
+
+        copilot.meta = None;
+        assert!(!provider_needs_responses_namespace_flatten(
+            &copilot,
+            Some("grok-4.7")
+        ));
     }
 }

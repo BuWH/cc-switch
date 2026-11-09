@@ -54,6 +54,7 @@ pub fn import_omp_providers_from_live(state: &AppState) -> Result<usize, AppErro
     omp::import_from_live(state)
 }
 
+pub(crate) use claude_editor::{switch_drops as claude_switch_drops, SwitchDrops};
 pub use claude_editor::{EditorSave, EditorView};
 
 // Internal re-exports (pub(crate))
@@ -170,6 +171,10 @@ pub struct SwitchResult {
     /// Present only when this operation selected a local proxy target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::mode::controller::RouteSwitchResult>,
+    /// Codex only: this switch moved new sessions to the other history bucket
+    /// while unified history is off, so newer Codex locks the old bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_history_split: Option<crate::codex_history_migration::CodexHistorySplitHint>,
 }
 
 #[cfg(test)]

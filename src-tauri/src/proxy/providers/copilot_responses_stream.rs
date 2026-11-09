@@ -134,9 +134,9 @@ fn frame_end(bytes: &[u8]) -> Option<usize> {
         .position(|value| value == b"\n\n")
         .map(|p| p + 2);
     let crlf = bytes
-        .windows(4)
-        .position(|value| value == b"\r\n\r\n")
-        .map(|p| p + 4);
+        .windows(3)
+        .position(|value| value == b"\n\r\n")
+        .map(|p| p + 3);
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -373,6 +373,21 @@ event: response.completed\ndata: {\"response\":{\"id\":\"done-b\",\"output\":[{\
         assert_eq!(events[5]["response"]["id"], "response-b");
         assert_eq!(events[5]["response"]["output"][0]["id"], "first-b");
         assert!(events.iter().all(|event| event.get("type").is_none()));
+    }
+
+    #[tokio::test]
+    async fn copilot_mixed_line_endings_preserve_first_item_id() {
+        let input = Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"first\",\"delta\":\"ok\"}\n\r\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rotated\"}}\r\n\n",
+        );
+        let chunks = input
+            .iter()
+            .map(|byte| Bytes::copy_from_slice(&[*byte]))
+            .collect();
+        let output = normalize(chunks).await;
+        assert_eq!(parse_events(&output)[1]["item"]["id"], "first");
+        assert!(output.ends_with(b"\r\n\n"));
     }
 
     #[test]

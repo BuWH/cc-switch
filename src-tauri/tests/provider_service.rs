@@ -644,15 +644,21 @@ wire_api = "responses"
     );
     let takeover_config: toml::Value =
         toml::from_str(&config_after_takeover).expect("parse taken-over config");
+    assert!(
+        takeover_config.get("model_provider").is_none(),
+        "takeover with preserved OAuth should select the built-in OpenAI provider"
+    );
     assert_eq!(
-        takeover_config["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
-        Some(true),
-        "takeover with preserved OAuth should use native ChatGPT authentication"
+        takeover_config["openai_base_url"].as_str(),
+        Some(codex_proxy_base_url.as_str())
+    );
+    assert_eq!(
+        takeover_config["features"]["remote_control"].as_bool(),
+        Some(true)
     );
     assert!(
-        !config_after_takeover.contains("PROXY_MANAGED")
-            && !config_after_takeover.contains("experimental_bearer_token"),
-        "native-auth takeover must not override preserved OAuth with a proxy bearer token"
+        !config_after_takeover.contains("deepseek-key"),
+        "the third-party key must stay out of the local proxy contract"
     );
     assert!(
         !config_after_takeover.contains("https://api.deepseek.com/v1"),

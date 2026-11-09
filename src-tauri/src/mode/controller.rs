@@ -3501,15 +3501,18 @@ mod mode_tests {
 
         enter(&state, &AppType::Codex, false).await.expect("enter");
         let third_party = fs::read_to_string(&config_path).unwrap();
+        let third_party_doc: toml::Table = toml::from_str(&third_party).unwrap();
         assert!(
-            !third_party.contains(PROXY_TOKEN_PLACEHOLDER),
+            third_party_doc.get("model_provider").is_none(),
             "{third_party}"
         );
-        let third_party_doc: toml::Table = toml::from_str(&third_party).unwrap();
-        assert_eq!(
-            third_party_doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
-            Some(true)
+        assert!(
+            third_party_doc["openai_base_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("http://127.0.0.1:") && url.ends_with("/v1")),
+            "{third_party}"
         );
+        assert!(!third_party.contains("sk-relay"), "{third_party}");
         assert_eq!(
             third_party_doc["features"]["remote_control"].as_bool(),
             Some(true)
@@ -4612,44 +4615,67 @@ model_provider = "c"
     #[tokio::test]
     #[serial]
     async fn codex_proxy_native_auth_respects_store_and_current_login() {
-        for (store, logged_in, expected_native) in [
-            ("file", true, true),
-            ("file", false, false),
-            ("keyring", true, false),
-            ("auto", true, false),
-            ("ephemeral", true, false),
-        ] {
-            let _home = Home::new();
-            set_preservation(true);
-            let login = chatgpt_login("native");
-            seed_codex(
-                &format!("cli_auth_credentials_store = \"{store}\"\n[features]\ngoals = true\n"),
-                logged_in.then_some(&login),
-            );
-            let before_auth = fs::read(codex_auth_path()).ok();
-            let state = state_with(AppType::Codex, &codex_a_b(), "a").await;
-            enter(&state, &AppType::Codex, false)
-                .await
-                .expect("enter proxy");
-            let doc = codex_doc();
-            let route = &doc["model_providers"]["custom"];
-            assert_eq!(
-                route.get("experimental_bearer_token").is_none(),
-                expected_native,
-                "store={store}, logged_in={logged_in}"
-            );
-            assert_eq!(doc["features"]["goals"].as_bool(), Some(true));
-            if expected_native {
-                assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
-                assert_eq!(doc["features"]["remote_control"].as_bool(), Some(true));
-            } else {
-                assert_eq!(
-                    route["experimental_bearer_token"].as_str(),
-                    Some(PROXY_TOKEN_PLACEHOLDER)
+        for unified in [false, true] {
+            for (store, logged_in, expected_native) in [
+                ("file", true, true),
+                ("file", false, false),
+                ("keyring", true, false),
+                ("auto", true, false),
+                ("ephemeral", true, false),
+            ] {
+                let _home = Home::new();
+                crate::settings::update_settings(crate::settings::AppSettings {
+                    preserve_codex_official_auth_on_switch: true,
+                    unify_codex_session_history: unified,
+                    ..Default::default()
+                })
+                .unwrap();
+                let login = chatgpt_login("native");
+                seed_codex(
+                    &format!(
+                        "cli_auth_credentials_store = \"{store}\"\n[features]\ngoals = true\n"
+                    ),
+                    logged_in.then_some(&login),
                 );
+                let before_auth = fs::read(codex_auth_path()).ok();
+                let state = state_with(AppType::Codex, &codex_a_b(), "a").await;
+                enter(&state, &AppType::Codex, false)
+                    .await
+                    .expect("enter proxy");
+                let doc = codex_doc();
+                let openai_route =
+                    !unified && (expected_native || matches!(store, "keyring" | "auto"));
+                if openai_route {
+                    assert!(doc.get("model_provider").is_none(), "{}", codex_text());
+                    assert!(doc["openai_base_url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+                } else {
+                    assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+                    assert!(doc.get("openai_base_url").is_none(), "{}", codex_text());
+                    let route = &doc["model_providers"]["custom"];
+                    assert_eq!(
+                        route.get("experimental_bearer_token").is_none(),
+                        expected_native,
+                        "store={store}, logged_in={logged_in}, unified={unified}"
+                    );
+                    if expected_native {
+                        assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
+                    } else {
+                        assert_eq!(
+                            route["experimental_bearer_token"].as_str(),
+                            Some(PROXY_TOKEN_PLACEHOLDER)
+                        );
+                    }
+                }
+                assert_eq!(doc["features"]["goals"].as_bool(), Some(true));
+                if expected_native {
+                    assert_eq!(doc["features"]["remote_control"].as_bool(), Some(true));
+                }
+                assert!(!codex_text().contains("sk-a"));
+                assert_eq!(fs::read(codex_auth_path()).ok(), before_auth);
+                exit(&state, &AppType::Codex).await.expect("exit proxy");
             }
-            assert_eq!(fs::read(codex_auth_path()).ok(), before_auth);
-            exit(&state, &AppType::Codex).await.expect("exit proxy");
         }
     }
 

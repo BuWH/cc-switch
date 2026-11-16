@@ -264,7 +264,6 @@ describe("Codex model-fetch lifecycle", () => {
             displayName: "Model One",
             contextWindow: 400_000,
             supportsParallelToolCalls: false,
-            inputModalities: undefined,
           },
         ]);
       } else {
@@ -273,7 +272,7 @@ describe("Codex model-fetch lifecycle", () => {
     },
   );
 
-  it.each(providerKinds)(
+  it.each(providerKinds.filter((kind) => kind !== "copilot"))(
     "keeps the empty-list notification for %s",
     async (kind) => {
       fetchMockFor(kind).mockResolvedValue([]);
@@ -289,6 +288,35 @@ describe("Codex model-fetch lifecycle", () => {
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
+
+  it("explains an account without picker-enabled Copilot models", async () => {
+    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([]);
+    render(<Harness {...makeProps("copilot")} />);
+    fireEvent.click(fetchButton());
+
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith("copilot.noPickerModels"),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("explains Copilot models that do not support the selected format", async () => {
+    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
+      advertisedModel("responses-model"),
+    ]);
+    render(
+      <Harness
+        {...makeProps("copilot")}
+        copilotApiFormat={"openai_chat" as const}
+      />,
+    );
+    fireEvent.click(fetchButton());
+
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith("copilot.noModelsForApiFormat"),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+  });
 
   it.each(providerKinds)(
     "reports %s failures and releases loading state",
@@ -447,45 +475,50 @@ describe("Codex model-fetch lifecycle", () => {
     );
   });
 
-  it("does not declare new models text-only when Copilot omits vision metadata", async () => {
-    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
-      advertisedModel(),
-    ]);
-    const onCatalogModelsChange = vi.fn();
-    const props = {
-      ...makeProps("copilot"),
-      catalogModels: [],
-      onCatalogModelsChange,
-    };
-    render(<Harness {...props} />);
-    fireEvent.click(fetchButton());
+  it.each([
+    { vision: true, previous: undefined, expected: ["text", "image"] },
+    { vision: true, previous: ["text"], expected: ["text", "image"] },
+    {
+      vision: true,
+      previous: ["text", "image"],
+      expected: ["text", "image"],
+    },
+    { vision: false, previous: undefined, expected: ["text"] },
+    { vision: false, previous: ["text"], expected: ["text"] },
+    { vision: false, previous: ["text", "image"], expected: ["text"] },
+    { vision: undefined, previous: undefined, expected: undefined },
+    { vision: undefined, previous: ["text"], expected: ["text"] },
+    {
+      vision: undefined,
+      previous: ["text", "image"],
+      expected: ["text", "image"],
+    },
+  ])(
+    "maps Copilot vision=$vision with previous modalities=$previous",
+    async ({ vision, previous, expected }) => {
+      vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
+        { ...advertisedModel(), supports_vision: vision },
+      ]);
+      const props = {
+        ...makeProps("copilot"),
+        catalogModels: previous
+          ? [{ model: "model-1", inputModalities: previous }]
+          : [],
+      };
+      render(<Harness {...props} />);
+      fireEvent.click(fetchButton());
 
-    await waitFor(() => expect(props.onCatalogModelsChange).toHaveBeenCalled());
-    expect(
-      onCatalogModelsChange.mock.calls[0][0][0].inputModalities,
-    ).toBeUndefined();
-  });
-
-  it("honors an explicit text-only capability from Copilot", async () => {
-    vi.mocked(copilotGetModelsForAccount).mockResolvedValue([
-      { ...advertisedModel(), supports_vision: false },
-    ]);
-    const props = {
-      ...makeProps("copilot"),
-      catalogModels: [{ model: "model-1", inputModalities: ["text", "image"] }],
-    };
-    render(<Harness {...props} />);
-    fireEvent.click(fetchButton());
-
-    await waitFor(() =>
-      expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
-        expect.objectContaining({
-          model: "model-1",
-          inputModalities: ["text"],
-        }),
-      ]),
-    );
-  });
+      await waitFor(() => expect(fetchButton()).toBeEnabled());
+      expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+      const [models] = vi.mocked(props.onCatalogModelsChange!).mock.calls[0];
+      expect(models).toHaveLength(1);
+      expect(models[0].model).toBe("model-1");
+      expect(models[0].inputModalities).toEqual(expected);
+      if (expected === undefined) {
+        expect(models[0]).not.toHaveProperty("inputModalities");
+      }
+    },
+  );
 
   it("clears stale reasoning levels when Copilot explicitly reports none", async () => {
     vi.mocked(copilotGetModelsForAccount).mockResolvedValue([

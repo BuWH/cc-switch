@@ -157,7 +157,7 @@ pub fn resolve_model(client_id: &str, models: &[CopilotModel]) -> Option<Resolve
     Some(ResolvedCopilotModel {
         id: model.id.clone(),
         vendor: model.vendor.clone(),
-        transport: transport_for(model, CodexCopilotApiFormat::Auto),
+        transport: transport_for(&model.supported_endpoints, CodexCopilotApiFormat::Auto),
     })
 }
 
@@ -181,7 +181,7 @@ pub fn resolve_model_with_format_excluding(
     Some(ResolvedCopilotModel {
         id: model.id.clone(),
         vendor: model.vendor.clone(),
-        transport: transport_for(model, api_format),
+        transport: transport_for(&model.supported_endpoints, api_format),
     })
 }
 
@@ -227,12 +227,12 @@ fn match_copilot_model<'a>(
     })
 }
 
-fn transport_for(
-    model: &CopilotModel,
+pub fn transport_for(
+    supported_endpoints: &[String],
     api_format: CodexCopilotApiFormat,
 ) -> Option<CopilotTransport> {
     let supported = |expected: &[&str]| {
-        model.supported_endpoints.iter().find_map(|endpoint| {
+        supported_endpoints.iter().find_map(|endpoint| {
             let path = endpoint
                 .split_once('?')
                 .map_or(endpoint.as_str(), |(path, _)| path)
@@ -317,7 +317,9 @@ fn family_fallback(
                     models
                         .iter()
                         .find(|model| model.id.eq_ignore_ascii_case(&m.id))
-                        .is_some_and(|model| transport_for(model, format).is_some())
+                        .is_some_and(|model| {
+                            transport_for(&model.supported_endpoints, format).is_some()
+                        })
                 })
             })
             .filter_map(|m| extract_major_minor(&m.id).map(|v| (m, v)))

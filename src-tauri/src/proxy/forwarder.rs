@@ -4607,7 +4607,8 @@ fn copilot_api_format_for_model(
     {
         "anthropic"
     } else if (transport_for(supported_endpoints, CodexCopilotApiFormat::OpenaiResponses).is_some()
-        && transport_for(supported_endpoints, CodexCopilotApiFormat::OpenaiChat).is_none())
+        && (vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai"))
+            || transport_for(supported_endpoints, CodexCopilotApiFormat::OpenaiChat).is_none()))
         || (supported_endpoints.is_empty()
             && vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai")))
     {
@@ -7397,6 +7398,10 @@ mod tests {
             "anthropic"
         );
         let both = ["/v1/chat/completions", "/responses"].map(String::from);
+        assert_eq!(
+            copilot_api_format_for_model(Some("OpenAI"), &both),
+            "openai_responses"
+        );
         assert_eq!(
             copilot_api_format_for_model(Some("xAI"), &both),
             "openai_chat"

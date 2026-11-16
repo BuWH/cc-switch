@@ -1,4 +1,19 @@
 {
+  "codexRemote": {
+    "title": "Codex Remote",
+    "check": "Erneut prüfen",
+    "lastChecked": "Zuletzt geprüft: {{time}}",
+    "nextCheck": "Nächste Prüfung: {{time}}",
+    "states": {
+      "inactive": "Automatische Wiederherstellung inaktiv",
+      "checking": "Wird geprüft",
+      "desktop": "Von Desktop verwaltet; Fernverbindung nicht unabhängig geprüft",
+      "external": "Von einem anderen app-server verwaltet; unverändert",
+      "connected": "Verwalteter Hintergrunddienst verbunden",
+      "connecting": "Verwalteter Hintergrunddienst verbindet sich",
+      "degraded": "Fernwiederherstellung erfordert Aufmerksamkeit"
+    }
+  },
   "app": {
     "title": "CC Switch",
     "description": "Der All-in-One-Assistent für Claude Code, Codex & Gemini CLI"

@@ -1,4 +1,19 @@
 {
+  "codexRemote": {
+    "title": "Codex Uzaktan",
+    "check": "Yeniden kontrol et",
+    "lastChecked": "Son kontrol: {{time}}",
+    "nextCheck": "Sonraki kontrol: {{time}}",
+    "states": {
+      "inactive": "Otomatik kurtarma etkin değil",
+      "checking": "Kontrol ediliyor",
+      "desktop": "Desktop tarafından yönetiliyor; uzak bağlantı bağımsız olarak doğrulanmadı",
+      "external": "Başka bir app-server tarafından yönetiliyor; değiştirilmedi",
+      "connected": "Yönetilen arka plan hizmeti bağlı",
+      "connecting": "Yönetilen arka plan hizmeti bağlanıyor",
+      "degraded": "Uzaktan kurtarma için müdahale gerekiyor"
+    }
+  },
   "app": {
     "title": "CC Switch",
     "description": "Claude Code, Codex ve Gemini CLI için Hepsi Bir Arada Asistan"
